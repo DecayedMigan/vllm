@@ -90,6 +90,32 @@ def test_controller_caps_valid_policy_at_startup_limit(tmp_path):
     assert state.error is None
 
 
+def test_controller_does_not_reparse_unchanged_snapshot(monkeypatch, tmp_path):
+    protocol = load_protocol()
+    path = tmp_path / "policy.json"
+    write_snapshot(path, admission_limit=3)
+    reads = 0
+    original_read = protocol.read_policy_snapshot
+
+    def counted_read(policy_path):
+        nonlocal reads
+        reads += 1
+        return original_read(policy_path)
+
+    monkeypatch.setattr(protocol, "read_policy_snapshot", counted_read)
+    controller = protocol.PolicyController(
+        policy_path=path,
+        model_id="Qwen/Qwen3-8B",
+        startup_admission_limit=8,
+    )
+    now = datetime(2026, 7, 31, 0, 1, tzinfo=UTC)
+
+    assert controller.refresh(now).admission_limit == 3
+    assert controller.refresh(now).admission_limit == 3
+
+    assert reads == 1
+
+
 def test_controller_ignores_stale_generation_and_retains_live_policy(tmp_path):
     protocol = load_protocol()
     path = tmp_path / "policy.json"

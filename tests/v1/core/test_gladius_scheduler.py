@@ -134,6 +134,27 @@ def test_telemetry_write_failure_does_not_fail_schedule(monkeypatch, tmp_path):
     assert scheduler.max_num_running_reqs == 8
 
 
+def test_repeated_telemetry_failures_are_warning_rate_limited(monkeypatch, tmp_path):
+    module = load_scheduler_module(monkeypatch)
+    monkeypatch.delenv("GLADIUS_POLICY_PATH", raising=False)
+    monkeypatch.setenv(
+        "GLADIUS_TELEMETRY_PATH", str(tmp_path / "missing" / "telemetry.jsonl")
+    )
+    warnings = []
+    monkeypatch.setattr(
+        module.logger,
+        "warning",
+        lambda *args, **kwargs: warnings.append((args, kwargs)),
+    )
+    scheduler = module.GladiusScheduler(config(), None, None, 16)
+
+    scheduler.schedule()
+    scheduler.schedule()
+    scheduler.schedule()
+
+    assert len(warnings) == 1
+
+
 def test_lower_policy_does_not_evict_or_break_existing_running_requests(
     monkeypatch, tmp_path
 ):

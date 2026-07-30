@@ -151,6 +151,9 @@ class PolicyController:
         self._startup_admission_limit = startup_admission_limit
         self._current: PolicySnapshot | None = None
         self._highest_generation = -1
+        self._observed_fingerprint: tuple[int, int, int] | None = None
+        self._has_observed_file = False
+        self._last_error: str | None = None
 
     def _state(self, error: str | None) -> PolicyState:
         if self._current is None:
@@ -173,7 +176,7 @@ class PolicyController:
         )
 
     def refresh(self, now: datetime) -> PolicyState:
-        """Reload the snapshot and return the policy valid at ``now``."""
+        """Reload a changed snapshot and return the policy valid at ``now``."""
 
         if now.tzinfo is None or now.utcoffset() is None:
             raise ValueError("now must include a timezone")
@@ -182,8 +185,26 @@ class PolicyController:
         if self._current is not None and now >= self._current.expires_at:
             expiry_error = f"policy expired at {self._current.expires_at.isoformat()}"
             self._current = None
+            self._last_error = expiry_error
         if self._policy_path is None:
-            return self._state(expiry_error)
+            return self._state(expiry_error or self._last_error)
+
+        try:
+            stat = self._policy_path.stat()
+            fingerprint = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        except FileNotFoundError:
+            fingerprint = None
+        except OSError as exc:
+            self._last_error = f"policy file unreadable: {exc}"
+            return self._state(self._last_error)
+
+        if self._has_observed_file and fingerprint == self._observed_fingerprint:
+            return self._state(expiry_error or self._last_error)
+        self._has_observed_file = True
+        self._observed_fingerprint = fingerprint
+        if fingerprint is None:
+            self._last_error = f"policy file missing: {self._policy_path}"
+            return self._state(self._last_error)
 
         try:
             candidate = read_policy_snapshot(self._policy_path)
@@ -206,10 +227,12 @@ class PolicyController:
                     f"{candidate.generation} < {self._highest_generation}"
                 )
         except ProtocolError as exc:
-            return self._state(str(exc))
+            self._last_error = str(exc)
+            return self._state(self._last_error)
 
         self._current = candidate
         self._highest_generation = max(self._highest_generation, candidate.generation)
+        self._last_error = None
         return self._state(None)
 
 

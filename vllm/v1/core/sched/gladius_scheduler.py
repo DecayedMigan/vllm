@@ -42,6 +42,8 @@ class GladiusScheduler(Scheduler):
             os.environ.get("GLADIUS_ENGINE_ID") or f"pid-{os.getpid()}"
         )
         self._gladius_step = 0
+        self._gladius_last_telemetry_warning_step: int | None = None
+        self._gladius_telemetry_warning_interval = 100
 
     def schedule(self) -> SchedulerOutput:
         """Apply a live policy, schedule work, then emit best-effort telemetry."""
@@ -69,8 +71,15 @@ class GladiusScheduler(Scheduler):
                     timestamp=utc_now(),
                 )
             except Exception:
-                logger.warning(
-                    "Failed to append GLADIUS scheduler telemetry",
-                    exc_info=True,
-                )
+                last_warning = self._gladius_last_telemetry_warning_step
+                if (
+                    last_warning is None
+                    or self._gladius_step - last_warning
+                    >= self._gladius_telemetry_warning_interval
+                ):
+                    logger.warning(
+                        "Failed to append GLADIUS scheduler telemetry",
+                        exc_info=True,
+                    )
+                    self._gladius_last_telemetry_warning_step = self._gladius_step
         return scheduler_output
