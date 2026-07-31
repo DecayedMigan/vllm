@@ -12,7 +12,9 @@ from pathlib import Path
 
 import pytest
 
-from gladius_vllm.policy import PolicyLoader
+from gladius_vllm.policy import PolicyCorruptError, parse_policy_snapshot, PolicyLoader
+
+FIXTURE_PATH = Path(__file__).parent / "fixtures" / "gladius-control-protocol-v1.json"
 
 ENGINE_ID = "engine-test"
 MODEL_ID = "facebook/opt-125m"
@@ -31,7 +33,6 @@ def _write(path: Path, **overrides):
         "created_at": now.isoformat().replace("+00:00", "Z"),
         "expires_at": (now + timedelta(seconds=30)).isoformat().replace("+00:00", "Z"),
         "admission": {"max_num_seqs": 16, "max_num_batched_tokens": 512},
-        "notes": None,
     }
     payload.update(overrides)
     tmp = path.with_suffix(".tmp")
@@ -330,3 +331,69 @@ def test_naive_expires_at_rejected_as_corrupt_not_crash_on_later_expiry_check(tm
     # Re-polling must not raise even though nothing valid was ever accepted.
     decision = loader.poll()
     assert decision.status in ("corrupt", "no_policy")
+
+
+def test_admission_missing_key_entirely_rejected(tmp_path):
+    # Both admission keys must be *present* (value may be null) -- omitting
+    # a key entirely is stricter than passing null for it.
+    path = tmp_path / "policy_snapshot.json"
+    _write(path, admission={"max_num_seqs": 16})
+    loader = _loader(path)
+    decision = loader.poll()
+    assert decision.status == "corrupt"
+
+
+def test_unknown_top_level_field_rejected_as_corrupt(tmp_path):
+    path = tmp_path / "policy_snapshot.json"
+    _write(path, surprise=True)
+    loader = _loader(path)
+    decision = loader.poll()
+    assert decision.status == "corrupt"
+
+
+def test_corrupt_write_after_expiry_does_not_resurrect_expired_policy(tmp_path):
+    # The exact bug from the design doc's state table: a corrupt (or
+    # mismatched/regressed) write arriving *after* the last-good policy has
+    # already expired must fall to startup default, not resurrect the
+    # expired ceiling with the triggering event's status.
+    path = tmp_path / "policy_snapshot.json"
+    now = datetime.now(timezone.utc)
+    _write(
+        path,
+        admission={"max_num_seqs": 4, "max_num_batched_tokens": 128},
+        created_at=now.isoformat().replace("+00:00", "Z"),
+        expires_at=(now + timedelta(milliseconds=50)).isoformat().replace("+00:00", "Z"),
+    )
+    loader = _loader(path, poll_interval_ms=0)
+    first = loader.poll()
+    assert first.status == "active"
+    assert first.max_num_seqs == 4
+
+    time.sleep(0.1)  # let it expire
+    path.write_text("{not valid json")  # then a corrupt write arrives
+    decision = loader.poll()
+    assert decision.status == "corrupt"
+    assert decision.source == "default"
+    assert decision.max_num_seqs == STARTUP_SEQS  # not the expired 4
+
+
+class TestParsePolicySnapshotAgainstGoldenFixture:
+    """Cross-repo contract fixture -- an identical copy of this file lives in
+    ~/CODE/gladius so both repos validate against the same golden data."""
+
+    @staticmethod
+    def _fixture():
+        return json.loads(FIXTURE_PATH.read_text())
+
+    def test_valid_snapshot_parses(self):
+        fixture = self._fixture()
+        snapshot = parse_policy_snapshot(fixture["valid_snapshot"])
+        assert snapshot.policy_id == fixture["valid_snapshot"]["policy_id"]
+        assert snapshot.generation == fixture["valid_snapshot"]["generation"]
+        assert snapshot.max_num_seqs == fixture["valid_snapshot"]["admission"]["max_num_seqs"]
+
+    def test_all_invalid_snapshots_rejected(self):
+        fixture = self._fixture()
+        for case in fixture["invalid_snapshots"]:
+            with pytest.raises(PolicyCorruptError):
+                parse_policy_snapshot(case["payload"])

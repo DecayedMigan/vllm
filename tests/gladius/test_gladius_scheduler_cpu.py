@@ -50,7 +50,6 @@ def _write_snapshot(
             "max_num_seqs": max_num_seqs,
             "max_num_batched_tokens": max_num_batched_tokens,
         },
-        "notes": None,
     }
     path = directory / "policy_snapshot.json"
     tmp = directory / ".policy_snapshot.tmp"

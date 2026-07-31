@@ -37,7 +37,6 @@ def _write_snapshot(directory, *, engine_id, model_id, generation, max_num_seqs,
         "created_at": now.isoformat().replace("+00:00", "Z"),
         "expires_at": (now + timedelta(seconds=ttl_seconds)).isoformat().replace("+00:00", "Z"),
         "admission": {"max_num_seqs": max_num_seqs, "max_num_batched_tokens": None},
-        "notes": None,
     }
     path = directory / "policy_snapshot.json"
     tmp = directory / ".policy_snapshot.tmp"

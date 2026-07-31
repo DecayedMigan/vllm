@@ -1,0 +1,159 @@
+{
+  "contract_version": "1.0.0",
+  "valid_snapshot": {
+    "schema_version": "1.0.0",
+    "generation": 42,
+    "policy_id": "policy-42",
+    "model_id": "Qwen/Qwen3-8B",
+    "engine_id": "engine-a",
+    "created_at": "2026-07-31T00:00:00Z",
+    "expires_at": "2026-07-31T00:05:00Z",
+    "admission": {
+      "max_num_seqs": 8,
+      "max_num_batched_tokens": 2048
+    }
+  },
+  "valid_telemetry": {
+    "schema_version": "1.0.0",
+    "engine_id": "engine-a",
+    "model_id": "Qwen/Qwen3-8B",
+    "generation": 42,
+    "policy_id": "policy-42",
+    "decision_id": "policy-42",
+    "window_id": null,
+    "step": 901,
+    "created_at": "2026-07-31T00:01:00Z",
+    "expires_at": null,
+    "num_running_reqs": 8,
+    "num_waiting_reqs": 17,
+    "num_skipped_waiting_reqs": 9,
+    "num_scheduled_reqs": 4,
+    "num_scheduled_tokens": 512,
+    "num_prefill_reqs": 1,
+    "num_decode_reqs": 3,
+    "kv_cache_usage": 0.73,
+    "policy_status": "active",
+    "policy_source": "file",
+    "requested_admission": {"max_num_seqs": 8, "max_num_batched_tokens": 2048},
+    "effective_admission": {"max_num_seqs": 8, "max_num_batched_tokens": 2048},
+    "clamped": {"max_num_seqs": false, "max_num_batched_tokens": false}
+  },
+  "invalid_snapshots": [
+    {
+      "name": "unknown top-level field",
+      "reason": "top-level fields must exactly match the canonical set",
+      "payload": {
+        "schema_version": "1.0.0",
+        "generation": 42,
+        "policy_id": "policy-42",
+        "model_id": "Qwen/Qwen3-8B",
+        "engine_id": "engine-a",
+        "created_at": "2026-07-31T00:00:00Z",
+        "expires_at": "2026-07-31T00:05:00Z",
+        "admission": {"max_num_seqs": 8, "max_num_batched_tokens": 2048},
+        "notes": "not part of the canonical schema"
+      }
+    },
+    {
+      "name": "missing top-level field",
+      "reason": "engine_id is missing",
+      "payload": {
+        "schema_version": "1.0.0",
+        "generation": 42,
+        "policy_id": "policy-42",
+        "model_id": "Qwen/Qwen3-8B",
+        "created_at": "2026-07-31T00:00:00Z",
+        "expires_at": "2026-07-31T00:05:00Z",
+        "admission": {"max_num_seqs": 8, "max_num_batched_tokens": 2048}
+      }
+    },
+    {
+      "name": "legacy integer schema_version",
+      "reason": "schema_version must be a semver string, not an int",
+      "payload": {
+        "schema_version": 1,
+        "generation": 42,
+        "policy_id": "policy-42",
+        "model_id": "Qwen/Qwen3-8B",
+        "engine_id": "engine-a",
+        "created_at": "2026-07-31T00:00:00Z",
+        "expires_at": "2026-07-31T00:05:00Z",
+        "admission": {"max_num_seqs": 8, "max_num_batched_tokens": 2048}
+      }
+    },
+    {
+      "name": "unsupported schema_version major",
+      "reason": "major version 2 is not supported by this reader",
+      "payload": {
+        "schema_version": "2.0.0",
+        "generation": 42,
+        "policy_id": "policy-42",
+        "model_id": "Qwen/Qwen3-8B",
+        "engine_id": "engine-a",
+        "created_at": "2026-07-31T00:00:00Z",
+        "expires_at": "2026-07-31T00:05:00Z",
+        "admission": {"max_num_seqs": 8, "max_num_batched_tokens": 2048}
+      }
+    },
+    {
+      "name": "non-positive admission value",
+      "reason": "admission.max_num_seqs must be a positive int or null",
+      "payload": {
+        "schema_version": "1.0.0",
+        "generation": 42,
+        "policy_id": "policy-42",
+        "model_id": "Qwen/Qwen3-8B",
+        "engine_id": "engine-a",
+        "created_at": "2026-07-31T00:00:00Z",
+        "expires_at": "2026-07-31T00:05:00Z",
+        "admission": {"max_num_seqs": 0, "max_num_batched_tokens": 2048}
+      }
+    },
+    {
+      "name": "unknown admission key",
+      "reason": "admission must contain exactly max_num_seqs and max_num_batched_tokens",
+      "payload": {
+        "schema_version": "1.0.0",
+        "generation": 42,
+        "policy_id": "policy-42",
+        "model_id": "Qwen/Qwen3-8B",
+        "engine_id": "engine-a",
+        "created_at": "2026-07-31T00:00:00Z",
+        "expires_at": "2026-07-31T00:05:00Z",
+        "admission": {
+          "max_num_seqs": 8,
+          "max_num_batched_tokens": 2048,
+          "prefix_caching": true
+        }
+      }
+    },
+    {
+      "name": "naive created_at",
+      "reason": "timestamps must include timezone info",
+      "payload": {
+        "schema_version": "1.0.0",
+        "generation": 42,
+        "policy_id": "policy-42",
+        "model_id": "Qwen/Qwen3-8B",
+        "engine_id": "engine-a",
+        "created_at": "2026-07-31T00:00:00",
+        "expires_at": "2026-07-31T00:05:00Z",
+        "admission": {"max_num_seqs": 8, "max_num_batched_tokens": 2048}
+      }
+    },
+    {
+      "name": "expires_at not after created_at",
+      "reason": "expires_at must be strictly after created_at",
+      "payload": {
+        "schema_version": "1.0.0",
+        "generation": 42,
+        "policy_id": "policy-42",
+        "model_id": "Qwen/Qwen3-8B",
+        "engine_id": "engine-a",
+        "created_at": "2026-07-31T00:05:00Z",
+        "expires_at": "2026-07-31T00:05:00Z",
+        "admission": {"max_num_seqs": 8, "max_num_batched_tokens": 2048}
+      }
+    }
+  ]
+}

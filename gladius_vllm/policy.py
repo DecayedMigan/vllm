@@ -1,9 +1,10 @@
 """Atomic policy-snapshot hot-reload for GladiusScheduler.
 
-PolicyLoader.poll() is the single entry point: it never raises, and always
-returns a PolicyDecision usable directly by the scheduler. See the
-failure-mode table in the design plan for the exact mapping from file state
-to (decision, status) pairs.
+`parse_policy_snapshot()` is the public, canonical-contract parser (pure
+structural validation, no notion of "this engine's identity"). `PolicyLoader`
+layers engine/model-identity and generation-monotonicity checks on top of it
+and is the single entry point used by the scheduler: `PolicyLoader.poll()`
+never raises, and always returns a PolicyDecision usable directly.
 """
 
 from __future__ import annotations
@@ -37,16 +38,34 @@ PolicyStatus = Literal[
 
 PolicySource = Literal["file", "default"]
 
-_REQUIRED_FIELDS = (
-    "schema_version",
-    "generation",
-    "policy_id",
-    "model_id",
-    "engine_id",
-    "created_at",
-    "expires_at",
+_CANONICAL_SNAPSHOT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "generation",
+        "policy_id",
+        "model_id",
+        "engine_id",
+        "created_at",
+        "expires_at",
+        "admission",
+    }
 )
-_ADMISSION_ALLOWED_KEYS = {"max_num_seqs", "max_num_batched_tokens"}
+_ADMISSION_FIELDS = frozenset({"max_num_seqs", "max_num_batched_tokens"})
+
+
+@dataclass(frozen=True)
+class PolicySnapshot:
+    """A structurally-valid canonical policy_snapshot.json payload."""
+
+    schema_version: str
+    generation: int
+    policy_id: str
+    model_id: str
+    engine_id: str
+    created_at: datetime
+    expires_at: datetime
+    max_num_seqs: int | None
+    max_num_batched_tokens: int | None
 
 
 @dataclass(frozen=True)
@@ -76,21 +95,48 @@ def _default_decision(
     )
 
 
-def _parse_snapshot(
-    raw: dict, *, engine_id: str, model_id: str, last_accepted_generation: int | None
-) -> dict:
-    """Validate and return the parsed fields.
+def _require_nonempty_str(payload: dict, field: str) -> str:
+    value = payload[field]
+    if not isinstance(value, str) or not value:
+        raise PolicyCorruptError(f"{field} must be a non-empty string, got {value!r}")
+    return value
 
-    Raises PolicyCorruptError, PolicyEngineMismatchError, or PolicyStaleError.
+
+def _require_positive_int_or_none(admission: dict, field: str) -> int | None:
+    value = admission[field]
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise PolicyCorruptError(f"admission.{field} must be a positive int or null, got {value!r}")
+    return value
+
+
+def parse_policy_snapshot(payload: object) -> PolicySnapshot:
+    """Parse and strictly validate a canonical `policy_snapshot.json` payload.
+
+    Pure structural validation only: top-level fields must exactly match the
+    canonical set (unknown or missing fields are corrupt), IDs must be
+    non-empty strings, `admission` must have both keys present (value a
+    positive int or `null`), `schema_version` must be a semver string whose
+    major component is the currently supported one, and `expires_at` must be
+    strictly after `created_at` (both timezone-aware).
+
+    Does NOT check engine/model identity against a running instance, or
+    generation monotonicity -- those require caller context and are
+    `PolicyLoader`-level concerns layered on top of this parse.
+
+    Raises PolicyCorruptError on any violation.
     """
-    if not isinstance(raw, dict):
-        raise PolicyCorruptError(f"snapshot must be a JSON object, got {type(raw).__name__}")
+    if not isinstance(payload, dict):
+        raise PolicyCorruptError(f"snapshot must be a JSON object, got {type(payload).__name__}")
 
-    for field in _REQUIRED_FIELDS:
-        if field not in raw:
-            raise PolicyCorruptError(f"missing required field: {field}")
+    fields = set(payload)
+    if fields != _CANONICAL_SNAPSHOT_FIELDS:
+        missing = sorted(_CANONICAL_SNAPSHOT_FIELDS - fields)
+        unknown = sorted(fields - _CANONICAL_SNAPSHOT_FIELDS)
+        raise PolicyCorruptError(f"top-level fields mismatch: missing={missing}, unknown={unknown}")
 
-    schema_version = raw["schema_version"]
+    schema_version = payload["schema_version"]
     if not isinstance(schema_version, str):
         raise PolicyCorruptError("schema_version must be a string")
     if schema_version.split(".")[0] != SUPPORTED_SCHEMA_MAJOR:
@@ -99,69 +145,44 @@ def _parse_snapshot(
             f"(expected major {SUPPORTED_SCHEMA_MAJOR!r})"
         )
 
-    generation = raw["generation"]
+    generation = payload["generation"]
     if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
         raise PolicyCorruptError(f"generation must be a non-negative int, got {generation!r}")
 
-    policy_id = raw["policy_id"]
-    if not isinstance(policy_id, str) or not policy_id:
-        raise PolicyCorruptError("policy_id must be a non-empty string")
-
-    if raw["model_id"] != model_id:
-        raise PolicyEngineMismatchError(
-            f"model_id mismatch: snapshot={raw['model_id']!r} engine={model_id!r}"
-        )
-    if raw["engine_id"] != engine_id:
-        raise PolicyEngineMismatchError(
-            f"engine_id mismatch: snapshot={raw['engine_id']!r} engine={engine_id!r}"
-        )
+    policy_id = _require_nonempty_str(payload, "policy_id")
+    model_id = _require_nonempty_str(payload, "model_id")
+    engine_id = _require_nonempty_str(payload, "engine_id")
 
     try:
-        created_at = parse_iso8601(raw["created_at"])
-        expires_at = parse_iso8601(raw["expires_at"])
+        created_at = parse_iso8601(payload["created_at"])
+        expires_at = parse_iso8601(payload["expires_at"])
     except (TypeError, ValueError) as exc:
         raise PolicyCorruptError(f"invalid timestamp: {exc}") from exc
     if expires_at <= created_at:
         raise PolicyCorruptError("expires_at must be strictly after created_at")
 
-    admission = raw.get("admission") or {}
+    admission = payload["admission"]
     if not isinstance(admission, dict):
         raise PolicyCorruptError("admission must be an object")
-    unknown_keys = set(admission) - _ADMISSION_ALLOWED_KEYS
-    if unknown_keys:
-        raise PolicyCorruptError(f"unrecognized admission keys: {sorted(unknown_keys)}")
+    if set(admission) != _ADMISSION_FIELDS:
+        missing = sorted(_ADMISSION_FIELDS - set(admission))
+        unknown = sorted(set(admission) - _ADMISSION_FIELDS)
+        raise PolicyCorruptError(f"admission fields mismatch: missing={missing}, unknown={unknown}")
 
-    max_num_seqs = admission.get("max_num_seqs")
-    if max_num_seqs is not None:
-        if not isinstance(max_num_seqs, int) or isinstance(max_num_seqs, bool) or max_num_seqs < 1:
-            raise PolicyCorruptError(
-                f"admission.max_num_seqs must be a positive int, got {max_num_seqs!r}"
-            )
+    max_num_seqs = _require_positive_int_or_none(admission, "max_num_seqs")
+    max_num_batched_tokens = _require_positive_int_or_none(admission, "max_num_batched_tokens")
 
-    max_num_batched_tokens = admission.get("max_num_batched_tokens")
-    if max_num_batched_tokens is not None:
-        if (
-            not isinstance(max_num_batched_tokens, int)
-            or isinstance(max_num_batched_tokens, bool)
-            or max_num_batched_tokens < 1
-        ):
-            raise PolicyCorruptError(
-                "admission.max_num_batched_tokens must be a positive int, "
-                f"got {max_num_batched_tokens!r}"
-            )
-
-    if last_accepted_generation is not None and generation <= last_accepted_generation:
-        raise PolicyStaleError(
-            f"generation {generation} <= last accepted {last_accepted_generation}"
-        )
-
-    return {
-        "generation": generation,
-        "policy_id": policy_id,
-        "expires_at": expires_at,
-        "max_num_seqs": max_num_seqs,
-        "max_num_batched_tokens": max_num_batched_tokens,
-    }
+    return PolicySnapshot(
+        schema_version=schema_version,
+        generation=generation,
+        policy_id=policy_id,
+        model_id=model_id,
+        engine_id=engine_id,
+        created_at=created_at,
+        expires_at=expires_at,
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=max_num_batched_tokens,
+    )
 
 
 class PolicyLoader:
@@ -225,12 +246,20 @@ class PolicyLoader:
         try:
             raw_text = self._snapshot_path.read_text()
             raw = json.loads(raw_text)
-            parsed = _parse_snapshot(
-                raw,
-                engine_id=self._engine_id,
-                model_id=self._model_id,
-                last_accepted_generation=self._last_accepted_generation,
-            )
+            snapshot = parse_policy_snapshot(raw)
+            if snapshot.model_id != self._model_id or snapshot.engine_id != self._engine_id:
+                raise PolicyEngineMismatchError(
+                    f"snapshot identity {snapshot.engine_id!r}/{snapshot.model_id!r} "
+                    f"does not match this scheduler {self._engine_id!r}/{self._model_id!r}"
+                )
+            if (
+                self._last_accepted_generation is not None
+                and snapshot.generation <= self._last_accepted_generation
+            ):
+                raise PolicyStaleError(
+                    f"generation {snapshot.generation} <= "
+                    f"last accepted {self._last_accepted_generation}"
+                )
         except (OSError, json.JSONDecodeError, PolicyCorruptError):
             return self._reject_keep_last_or_default("corrupt")
         except PolicyEngineMismatchError:
@@ -238,17 +267,17 @@ class PolicyLoader:
         except PolicyStaleError:
             return self._reject_keep_last_or_default("rejected_regression")
 
-        self._last_accepted_generation = parsed["generation"]
-        self._last_accepted_policy_id = parsed["policy_id"]
-        self._last_accepted_expires_at = parsed["expires_at"]
+        self._last_accepted_generation = snapshot.generation
+        self._last_accepted_policy_id = snapshot.policy_id
+        self._last_accepted_expires_at = snapshot.expires_at
         self._last_accepted_max_num_seqs = (
-            parsed["max_num_seqs"]
-            if parsed["max_num_seqs"] is not None
+            snapshot.max_num_seqs
+            if snapshot.max_num_seqs is not None
             else self._startup_max_num_seqs
         )
         self._last_accepted_max_num_batched_tokens = (
-            parsed["max_num_batched_tokens"]
-            if parsed["max_num_batched_tokens"] is not None
+            snapshot.max_num_batched_tokens
+            if snapshot.max_num_batched_tokens is not None
             else self._startup_max_num_batched_tokens
         )
         self._last_decision = PolicyDecision(
@@ -273,7 +302,12 @@ class PolicyLoader:
         return datetime.now(timezone.utc) >= self._last_accepted_expires_at
 
     def _reject_keep_last_or_default(self, status: PolicyStatus) -> PolicyDecision:
-        if self._last_accepted_generation is None:
+        # A last-good policy is only worth keeping if it hasn't itself
+        # expired -- otherwise a corrupt/mismatched/stale write arriving
+        # after TTL would incorrectly resurrect an already-expired ceiling.
+        # `_is_expired()` is only called once `_last_accepted_generation` is
+        # known non-None, so `_last_accepted_expires_at` is guaranteed set.
+        if self._last_accepted_generation is None or self._is_expired():
             decision = self._default(status)
         else:
             decision = PolicyDecision(

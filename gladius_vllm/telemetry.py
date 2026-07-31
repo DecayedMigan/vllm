@@ -99,46 +99,70 @@ class TelemetryWriter:
         if self._step % self._sample_every_n_steps != 0:
             return
 
-        num_prefill, num_decode = _count_prefill_decode(scheduler, output)
-        stats = scheduler.make_stats()
-
-        clamped_max_num_seqs = decision.max_num_seqs > scheduler.startup_max_num_seqs
-        clamped_max_num_batched_tokens = (
-            decision.max_num_batched_tokens > scheduler.startup_max_num_batched_tokens
-        )
-
-        record = {
-            "schema_version": SCHEMA_VERSION,
-            "generation": decision.generation,
-            "policy_id": decision.policy_id,
-            "model_id": self._model_id,
-            "engine_id": self._engine_id,
-            "created_at": format_iso8601(),
-            "expires_at": None,
-            "step": self._step,
-            "num_running_reqs": stats.num_running_reqs if stats else len(scheduler.running),
-            "num_waiting_reqs": stats.num_waiting_reqs if stats else len(scheduler.waiting),
-            "num_skipped_waiting_reqs": (
-                stats.num_skipped_waiting_reqs if stats else len(scheduler.skipped_waiting)
-            ),
-            "num_scheduled_reqs": len(output.num_scheduled_tokens),
-            "num_scheduled_tokens": output.total_num_scheduled_tokens,
-            "num_prefill_reqs": num_prefill,
-            "num_decode_reqs": num_decode,
-            "kv_cache_usage": stats.kv_cache_usage if stats else None,
-            "policy_status": decision.status,
-            "policy_source": decision.source,
-            "clamped": {
-                "max_num_seqs": clamped_max_num_seqs,
-                "max_num_batched_tokens": clamped_max_num_batched_tokens,
-            },
-        }
+        # Everything from here down -- stats construction, prefill/decode
+        # derivation, dict build, JSON serialization, and the write/flush
+        # itself -- is one fail-open region: telemetry must never be able to
+        # take down schedule(). A single failure permanently disables this
+        # writer (closes the handle) rather than retrying every subsequent
+        # step, which both bounds it to exactly one warning (no separate
+        # rate-limiting needed) and avoids repeated failing syscalls against
+        # a persistently broken destination.
         try:
+            num_prefill, num_decode = _count_prefill_decode(scheduler, output)
+            stats = scheduler.make_stats()
+
+            requested_admission = {
+                "max_num_seqs": decision.max_num_seqs,
+                "max_num_batched_tokens": decision.max_num_batched_tokens,
+            }
+            effective_admission = {
+                "max_num_seqs": scheduler.max_num_running_reqs,
+                "max_num_batched_tokens": scheduler.max_num_scheduled_tokens,
+            }
+            clamped = {
+                "max_num_seqs": (
+                    effective_admission["max_num_seqs"] != requested_admission["max_num_seqs"]
+                ),
+                "max_num_batched_tokens": (
+                    effective_admission["max_num_batched_tokens"]
+                    != requested_admission["max_num_batched_tokens"]
+                ),
+            }
+
+            record = {
+                "schema_version": SCHEMA_VERSION,
+                "generation": decision.generation,
+                "policy_id": decision.policy_id,
+                "decision_id": decision.policy_id,  # == policy_id in schema 1.x
+                "window_id": None,  # vLLM has no notion of a control-plane window
+                "model_id": self._model_id,
+                "engine_id": self._engine_id,
+                "created_at": format_iso8601(),
+                "expires_at": None,
+                "step": self._step,
+                "num_running_reqs": stats.num_running_reqs if stats else len(scheduler.running),
+                "num_waiting_reqs": stats.num_waiting_reqs if stats else len(scheduler.waiting),
+                "num_skipped_waiting_reqs": (
+                    stats.num_skipped_waiting_reqs if stats else len(scheduler.skipped_waiting)
+                ),
+                "num_scheduled_reqs": len(output.num_scheduled_tokens),
+                "num_scheduled_tokens": output.total_num_scheduled_tokens,
+                "num_prefill_reqs": num_prefill,
+                "num_decode_reqs": num_decode,
+                "kv_cache_usage": stats.kv_cache_usage if stats else None,
+                "policy_status": decision.status,
+                "policy_source": decision.source,
+                "requested_admission": requested_admission,
+                "effective_admission": effective_admission,
+                "clamped": clamped,
+            }
             self._file.write(json.dumps(record) + "\n")
             self._file.flush()
-        except OSError:
+        except Exception:
             logger.warning(
-                "GLADIUS telemetry disabled: write to %s failed", self._path, exc_info=True
+                "GLADIUS telemetry disabled at step %d: record/write failed",
+                self._step,
+                exc_info=True,
             )
             try:
                 self._file.close()

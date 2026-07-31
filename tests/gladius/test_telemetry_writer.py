@@ -15,6 +15,8 @@ EXPECTED_FIELDS = {
     "schema_version",
     "generation",
     "policy_id",
+    "decision_id",
+    "window_id",
     "model_id",
     "engine_id",
     "created_at",
@@ -30,6 +32,8 @@ EXPECTED_FIELDS = {
     "kv_cache_usage",
     "policy_status",
     "policy_source",
+    "requested_admission",
+    "effective_admission",
     "clamped",
 }
 
@@ -46,8 +50,9 @@ def _fake_scheduler(
     running: list,
     waiting: list,
     skipped_waiting: list,
-    startup_max_num_seqs: int = 64,
-    startup_max_num_batched_tokens: int = 4096,
+    max_num_running_reqs: int = 64,
+    max_num_scheduled_tokens: int = 4096,
+    make_stats=None,
 ) -> SimpleNamespace:
     stats = SimpleNamespace(
         num_running_reqs=len(running),
@@ -60,9 +65,11 @@ def _fake_scheduler(
         running=running,
         waiting=waiting,
         skipped_waiting=skipped_waiting,
-        startup_max_num_seqs=startup_max_num_seqs,
-        startup_max_num_batched_tokens=startup_max_num_batched_tokens,
-        make_stats=lambda: stats,
+        # The *effective* ceilings actually applied this step (post-clamp),
+        # exactly as GladiusScheduler.schedule() would have set them.
+        max_num_running_reqs=max_num_running_reqs,
+        max_num_scheduled_tokens=max_num_scheduled_tokens,
+        make_stats=make_stats or (lambda: stats),
     )
 
 
@@ -106,6 +113,10 @@ def test_writes_one_valid_json_line_with_all_fields(tmp_path):
     assert set(record.keys()) == EXPECTED_FIELDS
     assert record["policy_status"] == "active"
     assert record["policy_source"] == "file"
+    assert record["decision_id"] == record["policy_id"] == "policy-1"
+    assert record["window_id"] is None
+    assert record["requested_admission"] == {"max_num_seqs": 64, "max_num_batched_tokens": 4096}
+    assert record["effective_admission"] == {"max_num_seqs": 64, "max_num_batched_tokens": 4096}
     assert record["clamped"] == {"max_num_seqs": False, "max_num_batched_tokens": False}
 
 
@@ -160,22 +171,27 @@ def test_prefill_decode_split_cached_finished_prompt_counts_as_decode(tmp_path):
     assert record["num_decode_reqs"] == 1
 
 
-def test_clamped_flag_true_when_decision_exceeds_startup_ceiling(tmp_path):
+def test_clamped_true_when_effective_differs_from_requested(tmp_path):
     path = tmp_path / "telemetry.jsonl"
     writer = TelemetryWriter(path=path, engine_id="e", model_id="m")
+    # The scheduler clamped down to 16/2048 even though the policy requested
+    # far more -- exactly what GladiusScheduler.schedule() does when a
+    # policy exceeds the startup ceiling (or is floored by running count).
     scheduler = _fake_scheduler(
         requests={},
         running=[],
         waiting=[],
         skipped_waiting=[],
-        startup_max_num_seqs=16,
-        startup_max_num_batched_tokens=2048,
+        max_num_running_reqs=16,
+        max_num_scheduled_tokens=2048,
     )
     output = _fake_output(new_req_ids=[], scheduled_tokens={})
     decision = _decision(max_num_seqs=999, max_num_batched_tokens=999999)
     writer.record(scheduler, output, decision)
     writer.close()
     record = json.loads(path.read_text().splitlines()[0])
+    assert record["requested_admission"] == {"max_num_seqs": 999, "max_num_batched_tokens": 999999}
+    assert record["effective_admission"] == {"max_num_seqs": 16, "max_num_batched_tokens": 2048}
     assert record["clamped"] == {"max_num_seqs": True, "max_num_batched_tokens": True}
 
 
@@ -273,3 +289,22 @@ def test_write_failure_mid_run_disables_further_writes_instead_of_raising(tmp_pa
     # Telemetry stays disabled (no crash) on subsequent calls too.
     writer.record(scheduler, output, _decision())
     assert len(path.read_text().splitlines()) == 1
+
+
+def test_stats_construction_failure_is_fail_open_not_just_write_failure(tmp_path):
+    # §2 of the canonical contract: "写入、stats 构造、序列化...均 fail-open" --
+    # not just the final write/flush. A broken make_stats() must not escape
+    # record() either.
+    path = tmp_path / "telemetry.jsonl"
+    writer = TelemetryWriter(path=path, engine_id="e", model_id="m")
+
+    def _broken_make_stats():
+        raise RuntimeError("stats subsystem exploded")
+
+    scheduler = _fake_scheduler(
+        requests={}, running=[], waiting=[], skipped_waiting=[], make_stats=_broken_make_stats
+    )
+    output = _fake_output(new_req_ids=[], scheduled_tokens={})
+    writer.record(scheduler, output, _decision())  # must not raise
+    assert writer._file is None
+    assert path.read_text() == ""
