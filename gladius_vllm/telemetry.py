@@ -9,15 +9,22 @@ ambiguity. See gladius_vllm.stat_logger for the optional secondary path.
 from __future__ import annotations
 
 import json
-import os
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from gladius_vllm.policy import PolicyDecision
-from gladius_vllm.schema import DEFAULT_TELEMETRY_SAMPLE_N, SCHEMA_VERSION, format_iso8601
+from gladius_vllm.schema import (
+    DEFAULT_TELEMETRY_SAMPLE_N,
+    SCHEMA_VERSION,
+    format_iso8601,
+    parse_int_env,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+
+logger = logging.getLogger(__name__)
 
 
 def _count_prefill_decode(scheduler: Any, output: "SchedulerOutput") -> tuple[int, int]:
@@ -44,10 +51,12 @@ def _count_prefill_decode(scheduler: Any, output: "SchedulerOutput") -> tuple[in
 
 
 def _resolve_sample_every_n_steps(explicit: int | None) -> int:
+    """Never returns < 1: a 0 or negative value would ZeroDivisionError in
+    record()'s modulo check, and telemetry must never be able to crash
+    scheduling."""
     if explicit is not None:
-        return explicit
-    env_value = os.environ.get("GLADIUS_TELEMETRY_SAMPLE_N")
-    return int(env_value) if env_value else DEFAULT_TELEMETRY_SAMPLE_N
+        return explicit if explicit >= 1 else DEFAULT_TELEMETRY_SAMPLE_N
+    return parse_int_env("GLADIUS_TELEMETRY_SAMPLE_N", DEFAULT_TELEMETRY_SAMPLE_N, minimum=1)
 
 
 class TelemetryWriter:
@@ -67,8 +76,16 @@ class TelemetryWriter:
         self._step = 0
         self._file = None
         if self._path is not None:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._file = open(self._path, "a")
+            try:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                self._file = open(self._path, "a")
+            except OSError:
+                logger.warning(
+                    "GLADIUS telemetry disabled: could not open %s for writing",
+                    self._path,
+                    exc_info=True,
+                )
+                self._file = None
 
     def record(
         self,
@@ -116,10 +133,23 @@ class TelemetryWriter:
                 "max_num_batched_tokens": clamped_max_num_batched_tokens,
             },
         }
-        self._file.write(json.dumps(record) + "\n")
-        self._file.flush()
+        try:
+            self._file.write(json.dumps(record) + "\n")
+            self._file.flush()
+        except OSError:
+            logger.warning(
+                "GLADIUS telemetry disabled: write to %s failed", self._path, exc_info=True
+            )
+            try:
+                self._file.close()
+            except OSError:
+                pass
+            self._file = None
 
     def close(self) -> None:
         if self._file is not None:
-            self._file.close()
+            try:
+                self._file.close()
+            except OSError:
+                pass
             self._file = None

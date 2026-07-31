@@ -34,13 +34,40 @@ POLICY_SOURCES = ("file", "default")
 
 
 def parse_iso8601(value: str) -> datetime:
-    """Parse an ISO-8601 UTC string, tolerating a trailing 'Z' (py3.10 compat)."""
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    """Parse an ISO-8601 UTC string, tolerating a trailing 'Z' (py3.10 compat).
+
+    Raises ValueError for naive timestamps (no timezone info) rather than
+    silently accepting them -- comparing a naive datetime against the aware
+    `datetime.now(timezone.utc)` used for expiry checks raises TypeError,
+    which would otherwise escape PolicyLoader.poll()'s never-raises contract.
+    """
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        raise ValueError(f"timestamp must include timezone info, got {value!r}")
+    return dt
 
 
 def format_iso8601(dt: datetime | None = None) -> str:
     dt = dt or datetime.now(timezone.utc)
     return dt.isoformat().replace("+00:00", "Z")
+
+
+def parse_int_env(name: str, default: int, minimum: int | None = None) -> int:
+    """Parse an int env var, falling back to `default` on any invalid value.
+
+    Env vars are an external input surface and must never be able to crash
+    scheduler/engine startup or a per-step telemetry write.
+    """
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if minimum is not None and value < minimum:
+        return default
+    return value
 
 
 def resolve_engine_id(vllm_config: "VllmConfig") -> str:

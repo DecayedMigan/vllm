@@ -83,6 +83,9 @@ def _parse_snapshot(
 
     Raises PolicyCorruptError, PolicyEngineMismatchError, or PolicyStaleError.
     """
+    if not isinstance(raw, dict):
+        raise PolicyCorruptError(f"snapshot must be a JSON object, got {type(raw).__name__}")
+
     for field in _REQUIRED_FIELDS:
         if field not in raw:
             raise PolicyCorruptError(f"missing required field: {field}")
