@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from gladius_vllm.policy import PolicyCorruptError, parse_policy_snapshot, PolicyLoader
+from gladius_vllm.policy import PolicyCorruptError, PolicyLoader, parse_policy_snapshot
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "gladius-control-protocol-v1.json"
 
@@ -196,7 +196,9 @@ def test_policy_expires_mid_run_after_being_valid(tmp_path):
     _write(
         path,
         created_at=now.isoformat().replace("+00:00", "Z"),
-        expires_at=(now + timedelta(milliseconds=50)).isoformat().replace("+00:00", "Z"),
+        expires_at=(now + timedelta(milliseconds=50))
+        .isoformat()
+        .replace("+00:00", "Z"),
     )
     loader = _loader(path, poll_interval_ms=0)
     first = loader.poll()
@@ -251,7 +253,9 @@ def test_range_validation_rejects_bad_values(tmp_path, admission):
     assert decision.status == "corrupt"
 
 
-def test_policy_above_startup_ceiling_passes_through_unclamped_at_loader_level(tmp_path):
+def test_policy_above_startup_ceiling_passes_through_unclamped_at_loader_level(
+    tmp_path,
+):
     path = tmp_path / "policy_snapshot.json"
     _write(
         path,
@@ -362,7 +366,9 @@ def test_corrupt_write_after_expiry_does_not_resurrect_expired_policy(tmp_path):
         path,
         admission={"max_num_seqs": 4, "max_num_batched_tokens": 128},
         created_at=now.isoformat().replace("+00:00", "Z"),
-        expires_at=(now + timedelta(milliseconds=50)).isoformat().replace("+00:00", "Z"),
+        expires_at=(now + timedelta(milliseconds=50))
+        .isoformat()
+        .replace("+00:00", "Z"),
     )
     loader = _loader(path, poll_interval_ms=0)
     first = loader.poll()
@@ -390,10 +396,107 @@ class TestParsePolicySnapshotAgainstGoldenFixture:
         snapshot = parse_policy_snapshot(fixture["valid_snapshot"])
         assert snapshot.policy_id == fixture["valid_snapshot"]["policy_id"]
         assert snapshot.generation == fixture["valid_snapshot"]["generation"]
-        assert snapshot.max_num_seqs == fixture["valid_snapshot"]["admission"]["max_num_seqs"]
+        assert (
+            snapshot.max_num_seqs
+            == fixture["valid_snapshot"]["admission"]["max_num_seqs"]
+        )
 
     def test_all_invalid_snapshots_rejected(self):
         fixture = self._fixture()
         for case in fixture["invalid_snapshots"]:
             with pytest.raises(PolicyCorruptError):
                 parse_policy_snapshot(case["payload"])
+
+
+def _valid_payload(**overrides):
+    payload = json.loads(FIXTURE_PATH.read_text())["valid_snapshot"]
+    payload = dict(payload)
+    payload["admission"] = dict(payload["admission"])
+    payload.update(overrides)
+    return payload
+
+
+@pytest.mark.parametrize(
+    "schema_version",
+    [
+        "1",  # major only, no minor.patch
+        "1.0",  # major.minor only, no patch
+        "1.foo",  # non-numeric component
+        1,  # not a string at all
+        "01.0.0",  # leading zero -- not strict MAJOR.MINOR.PATCH
+        "1.0.0-rc1",  # pre-release suffix not accepted by strict parser
+        "",
+    ],
+)
+def test_strict_semver_rejects_non_major_minor_patch_forms(schema_version):
+    payload = _valid_payload(schema_version=schema_version)
+    with pytest.raises(PolicyCorruptError):
+        parse_policy_snapshot(payload)
+
+
+@pytest.mark.parametrize("schema_version", ["1.0.0", "1.2.3", "1.9.99"])
+def test_strict_semver_accepts_well_formed_major_1(schema_version):
+    payload = _valid_payload(schema_version=schema_version)
+    snapshot = parse_policy_snapshot(payload)
+    assert snapshot.schema_version == schema_version
+
+
+def test_strict_semver_rejects_major_2():
+    payload = _valid_payload(schema_version="2.0.0")
+    with pytest.raises(PolicyCorruptError):
+        parse_policy_snapshot(payload)
+
+
+def test_stat_permission_error_does_not_escape_poll_first_load(tmp_path, monkeypatch):
+    # Path.stat() can raise more than FileNotFoundError (PermissionError,
+    # transient I/O errors) -- none of these may escape poll(). With no
+    # last-good policy yet, this falls to the startup default. The patch is
+    # scoped tightly with monkeypatch.context() so it can't leak into
+    # pytest's own Path.stat() usage during teardown/traceback formatting.
+    path = tmp_path / "policy_snapshot.json"
+    _write(path)  # file exists, but stat() will be made to fail below
+    loader = _loader(path)
+
+    def _raise_permission_error(self, *args, **kwargs):
+        raise PermissionError("permission denied")
+
+    with monkeypatch.context() as m:
+        m.setattr(Path, "stat", _raise_permission_error)
+        decision = loader.poll()  # must not raise
+    assert decision.status == "corrupt"
+    assert decision.source == "default"
+    assert decision.max_num_seqs == STARTUP_SEQS
+
+
+def test_stat_permission_error_after_good_load_keeps_unexpired_last_good(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "policy_snapshot.json"
+    _write(path, admission={"max_num_seqs": 4, "max_num_batched_tokens": 128})
+    loader = _loader(path)
+    good = loader.poll()
+    assert good.status == "active"
+
+    def _raise_permission_error(self, *args, **kwargs):
+        raise PermissionError("permission denied")
+
+    with monkeypatch.context() as m:
+        m.setattr(Path, "stat", _raise_permission_error)
+        decision = loader.poll()  # must not raise
+    assert decision.status == "corrupt"
+    assert decision.source == "file"
+    assert decision.max_num_seqs == 4  # unexpired last-good preserved
+
+
+def test_stat_generic_oserror_does_not_escape_poll(tmp_path, monkeypatch):
+    path = tmp_path / "policy_snapshot.json"
+    _write(path)
+    loader = _loader(path)
+
+    def _raise_oserror(self, *args, **kwargs):
+        raise OSError(5, "I/O error")
+
+    with monkeypatch.context() as m:
+        m.setattr(Path, "stat", _raise_oserror)
+        decision = loader.poll()  # must not raise
+    assert decision.status == "corrupt"

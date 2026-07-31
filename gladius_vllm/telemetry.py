@@ -8,13 +8,17 @@ ambiguity. See gladius_vllm.stat_logger for the optional secondary path.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from gladius_vllm.policy import PolicyDecision
 from gladius_vllm.schema import (
+    DEFAULT_TELEMETRY_MAX_BYTES,
     DEFAULT_TELEMETRY_SAMPLE_N,
     SCHEMA_VERSION,
     format_iso8601,
@@ -27,7 +31,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _count_prefill_decode(scheduler: Any, output: "SchedulerOutput") -> tuple[int, int]:
+def _count_prefill_decode(scheduler: Any, output: SchedulerOutput) -> tuple[int, int]:
     """Derive prefill/decode counts from SchedulerOutput + Request state.
 
     A request counts as "prefill" this step if it's a brand-new admission (in
@@ -43,7 +47,10 @@ def _count_prefill_decode(scheduler: Any, output: "SchedulerOutput") -> tuple[in
             num_prefill += 1
             continue
         request = scheduler.requests.get(req_id)
-        if request is not None and request.num_computed_tokens < request.num_prompt_tokens:
+        if (
+            request is not None
+            and request.num_computed_tokens < request.num_prompt_tokens
+        ):
             num_prefill += 1
         else:
             num_decode += 1
@@ -56,7 +63,17 @@ def _resolve_sample_every_n_steps(explicit: int | None) -> int:
     scheduling."""
     if explicit is not None:
         return explicit if explicit >= 1 else DEFAULT_TELEMETRY_SAMPLE_N
-    return parse_int_env("GLADIUS_TELEMETRY_SAMPLE_N", DEFAULT_TELEMETRY_SAMPLE_N, minimum=1)
+    return parse_int_env(
+        "GLADIUS_TELEMETRY_SAMPLE_N", DEFAULT_TELEMETRY_SAMPLE_N, minimum=1
+    )
+
+
+def _resolve_max_bytes(explicit: int | None) -> int:
+    if explicit is not None:
+        return explicit if explicit >= 1 else DEFAULT_TELEMETRY_MAX_BYTES
+    return parse_int_env(
+        "GLADIUS_TELEMETRY_MAX_BYTES", DEFAULT_TELEMETRY_MAX_BYTES, minimum=1
+    )
 
 
 class TelemetryWriter:
@@ -68,17 +85,23 @@ class TelemetryWriter:
         engine_id: str,
         model_id: str,
         sample_every_n_steps: int | None = None,
+        max_bytes: int | None = None,
     ) -> None:
         self._path = path
         self._engine_id = engine_id
         self._model_id = model_id
         self._sample_every_n_steps = _resolve_sample_every_n_steps(sample_every_n_steps)
+        self._max_bytes = _resolve_max_bytes(max_bytes)
         self._step = 0
+        self._rotation_count = 0
         self._file = None
         if self._path is not None:
             try:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
-                self._file = open(self._path, "a")
+                # Deliberately not a `with` block: this handle is kept open
+                # across many record() calls over the writer's lifetime, not
+                # scoped to one operation.
+                self._file = open(self._path, "a")  # noqa: SIM115
             except OSError:
                 logger.warning(
                     "GLADIUS telemetry disabled: could not open %s for writing",
@@ -87,10 +110,46 @@ class TelemetryWriter:
                 )
                 self._file = None
 
+    def _rotate_if_needed(self) -> None:
+        """Best-effort size-based rotation: never splits a JSONL record --
+        only checked between records, before the next write -- and any
+        failure here just skips rotation for this cycle (keeps appending to
+        the existing file, growing past `max_bytes` this once) rather than
+        disabling telemetry entirely. A failed rotation is a lesser problem
+        than a failed write, so it gets its own, narrower fail-open handling
+        instead of falling through to record()'s disable-on-failure path.
+        """
+        if self._file is None or self._path is None:
+            return
+        try:
+            if self._path.stat().st_size < self._max_bytes:
+                return
+            self._file.close()
+            self._rotation_count += 1
+            # Counter guarantees uniqueness even for back-to-back rotations
+            # within the same millisecond (small max_bytes, high QPS); the
+            # timestamp prefix keeps rotated files human-orderable.
+            rotated_path = self._path.with_name(
+                f"{self._path.name}.{int(time.time() * 1000)}-{self._rotation_count}"
+            )
+            os.replace(self._path, rotated_path)
+            self._file = open(self._path, "a")  # noqa: SIM115 (persistent handle)
+        except OSError:
+            logger.warning(
+                "GLADIUS telemetry rotation failed for %s; continuing without rotating",
+                self._path,
+                exc_info=True,
+            )
+            if self._file is None or self._file.closed:
+                try:
+                    self._file = open(self._path, "a")  # noqa: SIM115
+                except OSError:
+                    self._file = None
+
     def record(
         self,
         scheduler: Any,
-        output: "SchedulerOutput",
+        output: SchedulerOutput,
         decision: PolicyDecision,
     ) -> None:
         self._step += 1
@@ -108,6 +167,9 @@ class TelemetryWriter:
         # rate-limiting needed) and avoids repeated failing syscalls against
         # a persistently broken destination.
         try:
+            self._rotate_if_needed()
+            if self._file is None:
+                return
             num_prefill, num_decode = _count_prefill_decode(scheduler, output)
             stats = scheduler.make_stats()
 
@@ -121,7 +183,8 @@ class TelemetryWriter:
             }
             clamped = {
                 "max_num_seqs": (
-                    effective_admission["max_num_seqs"] != requested_admission["max_num_seqs"]
+                    effective_admission["max_num_seqs"]
+                    != requested_admission["max_num_seqs"]
                 ),
                 "max_num_batched_tokens": (
                     effective_admission["max_num_batched_tokens"]
@@ -140,10 +203,16 @@ class TelemetryWriter:
                 "created_at": format_iso8601(),
                 "expires_at": None,
                 "step": self._step,
-                "num_running_reqs": stats.num_running_reqs if stats else len(scheduler.running),
-                "num_waiting_reqs": stats.num_waiting_reqs if stats else len(scheduler.waiting),
+                "num_running_reqs": stats.num_running_reqs
+                if stats
+                else len(scheduler.running),
+                "num_waiting_reqs": stats.num_waiting_reqs
+                if stats
+                else len(scheduler.waiting),
                 "num_skipped_waiting_reqs": (
-                    stats.num_skipped_waiting_reqs if stats else len(scheduler.skipped_waiting)
+                    stats.num_skipped_waiting_reqs
+                    if stats
+                    else len(scheduler.skipped_waiting)
                 ),
                 "num_scheduled_reqs": len(output.num_scheduled_tokens),
                 "num_scheduled_tokens": output.total_num_scheduled_tokens,
@@ -164,16 +233,12 @@ class TelemetryWriter:
                 self._step,
                 exc_info=True,
             )
-            try:
+            with contextlib.suppress(OSError):
                 self._file.close()
-            except OSError:
-                pass
             self._file = None
 
     def close(self) -> None:
         if self._file is not None:
-            try:
+            with contextlib.suppress(OSError):
                 self._file.close()
-            except OSError:
-                pass
             self._file = None

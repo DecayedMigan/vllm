@@ -23,26 +23,29 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from vllm.v1.metrics.loggers import StatLoggerBase
-
 from gladius_vllm.registry import get_scheduler
 from gladius_vllm.schema import resolve_engine_id
+from vllm.v1.metrics.loggers import StatLoggerBase
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.v1.metrics.stats import IterationStats, MultiModalCacheStats, SchedulerStats
+    from vllm.v1.metrics.stats import (
+        IterationStats,
+        MultiModalCacheStats,
+        SchedulerStats,
+    )
 
 
 class GladiusStatLogger(StatLoggerBase):
-    def __init__(self, vllm_config: "VllmConfig", engine_index: int = 0) -> None:
+    def __init__(self, vllm_config: VllmConfig, engine_index: int = 0) -> None:
         self._engine_id = resolve_engine_id(vllm_config)
         self._engine_index = engine_index
 
     def record(
         self,
-        scheduler_stats: "SchedulerStats | None",
-        iteration_stats: "IterationStats | None",
-        mm_cache_stats: "MultiModalCacheStats | None" = None,
+        scheduler_stats: SchedulerStats | None,
+        iteration_stats: IterationStats | None,
+        mm_cache_stats: MultiModalCacheStats | None = None,
         engine_idx: int = 0,
     ) -> None:
         # Lazy per-call lookup (not cached at __init__) since construction

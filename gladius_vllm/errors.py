@@ -13,7 +13,7 @@ class PolicySnapshotError(Exception):
 
 
 class PolicyCorruptError(PolicySnapshotError):
-    """Snapshot is missing, malformed JSON, wrong types, or fails range/schema validation."""
+    """Snapshot missing, malformed JSON, wrong types, or fails schema validation."""
 
 
 class PolicyStaleError(PolicySnapshotError):

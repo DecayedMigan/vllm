@@ -24,8 +24,6 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from vllm.v1.core.sched.scheduler import Scheduler
-
 from gladius_vllm.policy import PolicyLoader
 from gladius_vllm.registry import register_scheduler
 from gladius_vllm.schema import (
@@ -35,12 +33,29 @@ from gladius_vllm.schema import (
     resolve_model_id,
 )
 from gladius_vllm.telemetry import TelemetryWriter
+from vllm.v1.core.sched.scheduler import Scheduler
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
 POLICY_SNAPSHOT_FILENAME = "policy_snapshot.json"
 TELEMETRY_FILENAME = "telemetry.jsonl"
+
+
+def _resolve_poll_interval_ms() -> int:
+    """Production polling interval forbids 0: it would mean an unconditional
+    `Path.stat()` on every single scheduling step regardless of QPS. The env
+    var therefore enforces a minimum of 1.
+
+    Tests that need deterministic, immediate re-polling (no rate-limit
+    window between writing a new snapshot and observing it) should
+    monkeypatch this function directly instead, e.g.:
+    `monkeypatch.setattr(gladius_vllm.scheduler,
+    "_resolve_poll_interval_ms", lambda: 0)`.
+    """
+    return parse_int_env(
+        "GLADIUS_POLICY_POLL_INTERVAL_MS", DEFAULT_POLICY_POLL_INTERVAL_MS, minimum=1
+    )
 
 
 class GladiusScheduler(Scheduler):
@@ -69,9 +84,7 @@ class GladiusScheduler(Scheduler):
 
         policy_dir_env = os.environ.get("GLADIUS_POLICY_DIR")
         policy_dir = Path(policy_dir_env) if policy_dir_env else None
-        poll_interval_ms = parse_int_env(
-            "GLADIUS_POLICY_POLL_INTERVAL_MS", DEFAULT_POLICY_POLL_INTERVAL_MS, minimum=0
-        )
+        poll_interval_ms = _resolve_poll_interval_ms()
 
         self._policy_loader = PolicyLoader(
             snapshot_path=policy_dir / POLICY_SNAPSHOT_FILENAME if policy_dir else None,
@@ -89,7 +102,7 @@ class GladiusScheduler(Scheduler):
 
         register_scheduler(self)
 
-    def schedule(self) -> "SchedulerOutput":
+    def schedule(self) -> SchedulerOutput:
         decision = self._policy_loader.poll()
         target_max_num_seqs = min(decision.max_num_seqs, self.startup_max_num_seqs)
         # Never shrink below the number of requests already admitted: the

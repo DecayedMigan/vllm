@@ -15,8 +15,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from tests.v1.core.utils import create_requests, create_scheduler
 from gladius_vllm.scheduler import GladiusScheduler
+from tests.v1.core.utils import create_requests, create_scheduler
 
 # See tests/gladius/conftest.py for the autouse HF_HUB_OFFLINE/no-proxy
 # fixture required before any vllm config object (e.g. create_scheduler())
@@ -71,13 +71,18 @@ def _build_gladius_scheduler(vanilla, block_size=16):
 @pytest.fixture(autouse=True)
 def _fixed_engine_id(monkeypatch):
     monkeypatch.setenv("GLADIUS_ENGINE_ID", "test-engine")
-    monkeypatch.setenv("GLADIUS_POLICY_POLL_INTERVAL_MS", "0")
+    # Production forbids a 0ms polling interval via the env var (see
+    # gladius_vllm.scheduler._resolve_poll_interval_ms) -- tests that need
+    # deterministic immediate re-polling inject 0 directly instead.
+    monkeypatch.setattr("gladius_vllm.scheduler._resolve_poll_interval_ms", lambda: 0)
 
 
 def test_no_policy_file_matches_vanilla_scheduler_decisions(tmp_path, monkeypatch):
     monkeypatch.setenv("GLADIUS_POLICY_DIR", str(tmp_path))  # dir exists, no file in it
 
-    vanilla = create_scheduler(model=MODEL, max_num_seqs=16, max_num_batched_tokens=8192)
+    vanilla = create_scheduler(
+        model=MODEL, max_num_seqs=16, max_num_batched_tokens=8192
+    )
     gladius = _build_gladius_scheduler(vanilla)
 
     for req in create_requests(num_requests=20, num_tokens=50, max_tokens=8):
@@ -93,7 +98,10 @@ def test_no_policy_file_matches_vanilla_scheduler_decisions(tmp_path, monkeypatc
     assert sorted(gladius_output.num_scheduled_tokens.items()) == sorted(
         vanilla_output.num_scheduled_tokens.items()
     )
-    assert gladius_output.total_num_scheduled_tokens == vanilla_output.total_num_scheduled_tokens
+    assert (
+        gladius_output.total_num_scheduled_tokens
+        == vanilla_output.total_num_scheduled_tokens
+    )
     assert {r.req_id for r in gladius_output.scheduled_new_reqs} == {
         r.req_id for r in vanilla_output.scheduled_new_reqs
     }
@@ -102,7 +110,9 @@ def test_no_policy_file_matches_vanilla_scheduler_decisions(tmp_path, monkeypatc
 def test_no_policy_dir_configured_at_all_matches_vanilla(monkeypatch):
     monkeypatch.delenv("GLADIUS_POLICY_DIR", raising=False)
 
-    vanilla = create_scheduler(model=MODEL, max_num_seqs=16, max_num_batched_tokens=8192)
+    vanilla = create_scheduler(
+        model=MODEL, max_num_seqs=16, max_num_batched_tokens=8192
+    )
     gladius = _build_gladius_scheduler(vanilla)
 
     for req in create_requests(num_requests=5, num_tokens=50, max_tokens=8):
@@ -112,13 +122,18 @@ def test_no_policy_dir_configured_at_all_matches_vanilla(monkeypatch):
 
     vanilla_output = vanilla.schedule()
     gladius_output = gladius.schedule()
-    assert gladius_output.total_num_scheduled_tokens == vanilla_output.total_num_scheduled_tokens
+    assert (
+        gladius_output.total_num_scheduled_tokens
+        == vanilla_output.total_num_scheduled_tokens
+    )
 
 
 def test_policy_lowering_max_num_seqs_changes_admission(tmp_path, monkeypatch):
     monkeypatch.setenv("GLADIUS_POLICY_DIR", str(tmp_path))
 
-    vanilla = create_scheduler(model=MODEL, max_num_seqs=16, max_num_batched_tokens=8192)
+    vanilla = create_scheduler(
+        model=MODEL, max_num_seqs=16, max_num_batched_tokens=8192
+    )
     gladius = _build_gladius_scheduler(vanilla)
     _write_snapshot(
         tmp_path,
@@ -140,7 +155,9 @@ def test_policy_lowering_max_num_seqs_changes_admission(tmp_path, monkeypatch):
 def test_policy_lowering_token_budget_changes_scheduled_tokens(tmp_path, monkeypatch):
     monkeypatch.setenv("GLADIUS_POLICY_DIR", str(tmp_path))
 
-    vanilla = create_scheduler(model=MODEL, max_num_seqs=16, max_num_batched_tokens=8192)
+    vanilla = create_scheduler(
+        model=MODEL, max_num_seqs=16, max_num_batched_tokens=8192
+    )
     gladius = _build_gladius_scheduler(vanilla)
     _write_snapshot(
         tmp_path,
@@ -161,7 +178,9 @@ def test_policy_lowering_token_budget_changes_scheduled_tokens(tmp_path, monkeyp
 def test_policy_above_startup_ceiling_is_clamped_not_applied(tmp_path, monkeypatch):
     monkeypatch.setenv("GLADIUS_POLICY_DIR", str(tmp_path))
 
-    vanilla = create_scheduler(model=MODEL, max_num_seqs=16, max_num_batched_tokens=8192)
+    vanilla = create_scheduler(
+        model=MODEL, max_num_seqs=16, max_num_batched_tokens=8192
+    )
     gladius = _build_gladius_scheduler(vanilla)
     _write_snapshot(
         tmp_path,
@@ -180,7 +199,9 @@ def test_policy_above_startup_ceiling_is_clamped_not_applied(tmp_path, monkeypat
     # requested far more.
     assert gladius.max_num_running_reqs == gladius.startup_max_num_seqs == 16
     assert (
-        gladius.max_num_scheduled_tokens == gladius.startup_max_num_batched_tokens == 8192
+        gladius.max_num_scheduled_tokens
+        == gladius.startup_max_num_batched_tokens
+        == 8192
     )
 
 
@@ -194,7 +215,9 @@ def test_corrupt_then_valid_then_stale_generation_sequence(tmp_path, monkeypatch
     # running count rather than violating vLLM's own admission invariant).
     monkeypatch.setenv("GLADIUS_POLICY_DIR", str(tmp_path))
 
-    vanilla = create_scheduler(model=MODEL, max_num_seqs=16, max_num_batched_tokens=8192)
+    vanilla = create_scheduler(
+        model=MODEL, max_num_seqs=16, max_num_batched_tokens=8192
+    )
     gladius = _build_gladius_scheduler(vanilla)
 
     for req in create_requests(num_requests=20, num_tokens=10, max_tokens=8):
@@ -202,8 +225,11 @@ def test_corrupt_then_valid_then_stale_generation_sequence(tmp_path, monkeypatch
 
     # Step 1: valid snapshot, generation 5, lowers ceiling to 4 from the start.
     _write_snapshot(
-        tmp_path, engine_id=gladius.engine_id, model_id=gladius.model_id,
-        generation=5, max_num_seqs=4,
+        tmp_path,
+        engine_id=gladius.engine_id,
+        model_id=gladius.model_id,
+        generation=5,
+        max_num_seqs=4,
     )
     gladius.schedule()
     assert gladius.max_num_running_reqs == 4
@@ -215,25 +241,35 @@ def test_corrupt_then_valid_then_stale_generation_sequence(tmp_path, monkeypatch
 
     # Step 3: a regressed generation (3 < 5) -> rejected, still 4.
     _write_snapshot(
-        tmp_path, engine_id=gladius.engine_id, model_id=gladius.model_id,
-        generation=3, max_num_seqs=8,
+        tmp_path,
+        engine_id=gladius.engine_id,
+        model_id=gladius.model_id,
+        generation=3,
+        max_num_seqs=8,
     )
     gladius.schedule()
     assert gladius.max_num_running_reqs == 4
 
     # Step 4: a genuinely newer generation (6) -> accepted, ceiling raised to 8.
     _write_snapshot(
-        tmp_path, engine_id=gladius.engine_id, model_id=gladius.model_id,
-        generation=6, max_num_seqs=8,
+        tmp_path,
+        engine_id=gladius.engine_id,
+        model_id=gladius.model_id,
+        generation=6,
+        max_num_seqs=8,
     )
     gladius.schedule()
     assert gladius.max_num_running_reqs == 8
 
 
-def test_running_count_floor_when_ceiling_drops_below_already_admitted(tmp_path, monkeypatch):
+def test_running_count_floor_when_ceiling_drops_below_already_admitted(
+    tmp_path, monkeypatch
+):
     monkeypatch.setenv("GLADIUS_POLICY_DIR", str(tmp_path))
 
-    vanilla = create_scheduler(model=MODEL, max_num_seqs=16, max_num_batched_tokens=8192)
+    vanilla = create_scheduler(
+        model=MODEL, max_num_seqs=16, max_num_batched_tokens=8192
+    )
     gladius = _build_gladius_scheduler(vanilla)
 
     for req in create_requests(num_requests=20, num_tokens=10, max_tokens=8):
@@ -248,8 +284,11 @@ def test_running_count_floor_when_ceiling_drops_below_already_admitted(tmp_path,
     # scheduler floors the effective ceiling at the current running count
     # instead of violating the base Scheduler's own admission invariant.
     _write_snapshot(
-        tmp_path, engine_id=gladius.engine_id, model_id=gladius.model_id,
-        generation=1, max_num_seqs=4,
+        tmp_path,
+        engine_id=gladius.engine_id,
+        model_id=gladius.model_id,
+        generation=1,
+        max_num_seqs=4,
     )
     gladius.schedule()
     assert gladius.max_num_running_reqs == 16
@@ -259,15 +298,21 @@ def test_running_count_floor_when_ceiling_drops_below_already_admitted(tmp_path,
 def test_engine_degrades_when_policy_expires_mid_run(tmp_path, monkeypatch):
     monkeypatch.setenv("GLADIUS_POLICY_DIR", str(tmp_path))
 
-    vanilla = create_scheduler(model=MODEL, max_num_seqs=16, max_num_batched_tokens=8192)
+    vanilla = create_scheduler(
+        model=MODEL, max_num_seqs=16, max_num_batched_tokens=8192
+    )
     gladius = _build_gladius_scheduler(vanilla)
 
     for req in create_requests(num_requests=20, num_tokens=10, max_tokens=8):
         gladius.add_request(req)
 
     _write_snapshot(
-        tmp_path, engine_id=gladius.engine_id, model_id=gladius.model_id,
-        generation=1, max_num_seqs=4, ttl_seconds=0.05,
+        tmp_path,
+        engine_id=gladius.engine_id,
+        model_id=gladius.model_id,
+        generation=1,
+        max_num_seqs=4,
+        ttl_seconds=0.05,
     )
     gladius.schedule()
     assert gladius.max_num_running_reqs == 4
@@ -284,6 +329,8 @@ def test_invalid_poll_interval_env_var_falls_back_instead_of_crashing_startup(
     monkeypatch, bad_value
 ):
     monkeypatch.setenv("GLADIUS_POLICY_POLL_INTERVAL_MS", bad_value)
-    vanilla = create_scheduler(model=MODEL, max_num_seqs=16, max_num_batched_tokens=8192)
+    vanilla = create_scheduler(
+        model=MODEL, max_num_seqs=16, max_num_batched_tokens=8192
+    )
     gladius = _build_gladius_scheduler(vanilla)  # must not raise
     assert gladius._policy_loader is not None

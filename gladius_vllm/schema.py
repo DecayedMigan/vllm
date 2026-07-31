@@ -20,6 +20,7 @@ SUPPORTED_SCHEMA_MAJOR = SCHEMA_VERSION.split(".")[0]
 
 DEFAULT_POLICY_POLL_INTERVAL_MS = 50
 DEFAULT_TELEMETRY_SAMPLE_N = 1
+DEFAULT_TELEMETRY_MAX_BYTES = 64 * 1024 * 1024  # 64 MiB
 
 POLICY_STATUSES = (
     "active",
@@ -70,7 +71,7 @@ def parse_int_env(name: str, default: int, minimum: int | None = None) -> int:
     return value
 
 
-def resolve_engine_id(vllm_config: "VllmConfig") -> str:
+def resolve_engine_id(vllm_config: VllmConfig) -> str:
     """Stable id for this engine process.
 
     Prefers an explicit `GLADIUS_ENGINE_ID` env var (recommended for
@@ -88,7 +89,7 @@ def resolve_engine_id(vllm_config: "VllmConfig") -> str:
     return f"engine-{uuid.uuid4()}"
 
 
-def resolve_model_id(vllm_config: "VllmConfig") -> str:
+def resolve_model_id(vllm_config: VllmConfig) -> str:
     model_config = vllm_config.model_config
     served_name = getattr(model_config, "served_model_name", None)
     return served_name or model_config.model

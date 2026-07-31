@@ -10,6 +10,7 @@ never raises, and always returns a PolicyDecision usable directly.
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -51,6 +52,12 @@ _CANONICAL_SNAPSHOT_FIELDS = frozenset(
     }
 )
 _ADMISSION_FIELDS = frozenset({"max_num_seqs", "max_num_batched_tokens"})
+
+# Strict MAJOR.MINOR.PATCH only -- no leading zeros, no pre-release/build
+# metadata suffixes, no truncated forms ("1", "1.0"). Publishers write
+# exactly "1.0.0"; this reader tolerates any MINOR.PATCH as long as MAJOR
+# matches SUPPORTED_SCHEMA_MAJOR.
+_SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 
 
 @dataclass(frozen=True)
@@ -107,7 +114,9 @@ def _require_positive_int_or_none(admission: dict, field: str) -> int | None:
     if value is None:
         return None
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-        raise PolicyCorruptError(f"admission.{field} must be a positive int or null, got {value!r}")
+        raise PolicyCorruptError(
+            f"admission.{field} must be a positive int or null, got {value!r}"
+        )
     return value
 
 
@@ -128,26 +137,43 @@ def parse_policy_snapshot(payload: object) -> PolicySnapshot:
     Raises PolicyCorruptError on any violation.
     """
     if not isinstance(payload, dict):
-        raise PolicyCorruptError(f"snapshot must be a JSON object, got {type(payload).__name__}")
+        raise PolicyCorruptError(
+            f"snapshot must be a JSON object, got {type(payload).__name__}"
+        )
 
     fields = set(payload)
     if fields != _CANONICAL_SNAPSHOT_FIELDS:
         missing = sorted(_CANONICAL_SNAPSHOT_FIELDS - fields)
         unknown = sorted(fields - _CANONICAL_SNAPSHOT_FIELDS)
-        raise PolicyCorruptError(f"top-level fields mismatch: missing={missing}, unknown={unknown}")
+        raise PolicyCorruptError(
+            f"top-level fields mismatch: missing={missing}, unknown={unknown}"
+        )
 
     schema_version = payload["schema_version"]
     if not isinstance(schema_version, str):
-        raise PolicyCorruptError("schema_version must be a string")
-    if schema_version.split(".")[0] != SUPPORTED_SCHEMA_MAJOR:
+        raise PolicyCorruptError(
+            f"schema_version must be a string, got {schema_version!r}"
+        )
+    match = _SEMVER_RE.match(schema_version)
+    if match is None:
+        raise PolicyCorruptError(
+            f"schema_version must be strict MAJOR.MINOR.PATCH, got {schema_version!r}"
+        )
+    if match.group(1) != SUPPORTED_SCHEMA_MAJOR:
         raise PolicyCorruptError(
             f"unsupported schema_version major: {schema_version!r} "
             f"(expected major {SUPPORTED_SCHEMA_MAJOR!r})"
         )
 
     generation = payload["generation"]
-    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
-        raise PolicyCorruptError(f"generation must be a non-negative int, got {generation!r}")
+    if (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 0
+    ):
+        raise PolicyCorruptError(
+            f"generation must be a non-negative int, got {generation!r}"
+        )
 
     policy_id = _require_nonempty_str(payload, "policy_id")
     model_id = _require_nonempty_str(payload, "model_id")
@@ -167,10 +193,14 @@ def parse_policy_snapshot(payload: object) -> PolicySnapshot:
     if set(admission) != _ADMISSION_FIELDS:
         missing = sorted(_ADMISSION_FIELDS - set(admission))
         unknown = sorted(set(admission) - _ADMISSION_FIELDS)
-        raise PolicyCorruptError(f"admission fields mismatch: missing={missing}, unknown={unknown}")
+        raise PolicyCorruptError(
+            f"admission fields mismatch: missing={missing}, unknown={unknown}"
+        )
 
     max_num_seqs = _require_positive_int_or_none(admission, "max_num_seqs")
-    max_num_batched_tokens = _require_positive_int_or_none(admission, "max_num_batched_tokens")
+    max_num_batched_tokens = _require_positive_int_or_none(
+        admission, "max_num_batched_tokens"
+    )
 
     return PolicySnapshot(
         schema_version=schema_version,
@@ -237,6 +267,13 @@ class PolicyLoader:
         except FileNotFoundError:
             self._last_stat = None
             return self._default("no_policy")
+        except OSError:
+            # PermissionError, transient I/O errors, etc. -- distinct from
+            # "no policy configured": something is wrong reading a path that
+            # otherwise exists, so treat it like a corrupt read (keep an
+            # unexpired last-good if there is one) rather than silently
+            # reverting to native/default as if no policy were intended.
+            return self._reject_keep_last_or_default("corrupt")
 
         current_stat = (stat.st_mtime_ns, stat.st_size)
         if current_stat == self._last_stat:
@@ -247,10 +284,14 @@ class PolicyLoader:
             raw_text = self._snapshot_path.read_text()
             raw = json.loads(raw_text)
             snapshot = parse_policy_snapshot(raw)
-            if snapshot.model_id != self._model_id or snapshot.engine_id != self._engine_id:
+            if (
+                snapshot.model_id != self._model_id
+                or snapshot.engine_id != self._engine_id
+            ):
                 raise PolicyEngineMismatchError(
                     f"snapshot identity {snapshot.engine_id!r}/{snapshot.model_id!r} "
-                    f"does not match this scheduler {self._engine_id!r}/{self._model_id!r}"
+                    f"does not match this scheduler "
+                    f"{self._engine_id!r}/{self._model_id!r}"
                 )
             if (
                 self._last_accepted_generation is not None

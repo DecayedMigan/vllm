@@ -14,13 +14,13 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from gladius_vllm.scheduler import GladiusScheduler
 
-_ACTIVE: dict[str, "weakref.ref[GladiusScheduler]"] = {}
+_ACTIVE: dict[str, weakref.ref[GladiusScheduler]] = {}
 
 
-def register_scheduler(scheduler: "GladiusScheduler") -> None:
+def register_scheduler(scheduler: GladiusScheduler) -> None:
     _ACTIVE[scheduler.engine_id] = weakref.ref(scheduler)
 
 
-def get_scheduler(engine_id: str) -> "GladiusScheduler | None":
+def get_scheduler(engine_id: str) -> GladiusScheduler | None:
     ref = _ACTIVE.get(engine_id)
     return ref() if ref is not None else None

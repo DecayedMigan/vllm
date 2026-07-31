@@ -26,7 +26,9 @@ import pytest
 MODEL = "Qwen/Qwen3-1.7B"
 
 
-def _write_snapshot(directory, *, engine_id, model_id, generation, max_num_seqs, ttl_seconds=60.0):
+def _write_snapshot(
+    directory, *, engine_id, model_id, generation, max_num_seqs, ttl_seconds=60.0
+):
     now = datetime.now(timezone.utc)
     payload = {
         "schema_version": "1.0.0",
@@ -35,7 +37,9 @@ def _write_snapshot(directory, *, engine_id, model_id, generation, max_num_seqs,
         "model_id": model_id,
         "engine_id": engine_id,
         "created_at": now.isoformat().replace("+00:00", "Z"),
-        "expires_at": (now + timedelta(seconds=ttl_seconds)).isoformat().replace("+00:00", "Z"),
+        "expires_at": (now + timedelta(seconds=ttl_seconds))
+        .isoformat()
+        .replace("+00:00", "Z"),
         "admission": {"max_num_seqs": max_num_seqs, "max_num_batched_tokens": None},
     }
     path = directory / "policy_snapshot.json"
@@ -50,13 +54,16 @@ def test_gladius_scheduler_real_engine_contract(tmp_path, monkeypatch):
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     monkeypatch.setenv("GLADIUS_ENGINE_ID", "contract-test-engine")
     monkeypatch.setenv("GLADIUS_POLICY_DIR", str(tmp_path))
-    monkeypatch.setenv("GLADIUS_POLICY_POLL_INTERVAL_MS", "0")
 
+    from gladius_vllm.scheduler import GladiusScheduler
     from vllm.engine.arg_utils import EngineArgs
     from vllm.sampling_params import SamplingParams
     from vllm.v1.engine.llm_engine import LLMEngine
 
-    from gladius_vllm.scheduler import GladiusScheduler
+    # Production forbids a 0ms polling interval via the env var; this test
+    # needs deterministic immediate re-polling, so it injects 0 directly via
+    # the documented test-only hook instead.
+    monkeypatch.setattr("gladius_vllm.scheduler._resolve_poll_interval_ms", lambda: 0)
 
     engine_args = EngineArgs(
         model=MODEL,
@@ -105,7 +112,9 @@ def test_gladius_scheduler_real_engine_contract(tmp_path, monkeypatch):
 
     telemetry_path = tmp_path / "telemetry.jsonl"
     assert telemetry_path.exists()
-    lines = [json.loads(line) for line in telemetry_path.read_text().splitlines() if line]
+    lines = [
+        json.loads(line) for line in telemetry_path.read_text().splitlines() if line
+    ]
     assert len(lines) >= 2
     assert lines[0]["policy_status"] == "no_policy"
     assert any(line["policy_status"] == "active" for line in lines)

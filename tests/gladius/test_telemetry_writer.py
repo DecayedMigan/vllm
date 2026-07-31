@@ -115,8 +115,14 @@ def test_writes_one_valid_json_line_with_all_fields(tmp_path):
     assert record["policy_source"] == "file"
     assert record["decision_id"] == record["policy_id"] == "policy-1"
     assert record["window_id"] is None
-    assert record["requested_admission"] == {"max_num_seqs": 64, "max_num_batched_tokens": 4096}
-    assert record["effective_admission"] == {"max_num_seqs": 64, "max_num_batched_tokens": 4096}
+    assert record["requested_admission"] == {
+        "max_num_seqs": 64,
+        "max_num_batched_tokens": 4096,
+    }
+    assert record["effective_admission"] == {
+        "max_num_seqs": 64,
+        "max_num_batched_tokens": 4096,
+    }
     assert record["clamped"] == {"max_num_seqs": False, "max_num_batched_tokens": False}
 
 
@@ -141,7 +147,9 @@ def test_prefill_decode_split_cached_mid_prompt_counts_as_prefill(tmp_path):
     path = tmp_path / "telemetry.jsonl"
     writer = TelemetryWriter(path=path, engine_id="e", model_id="m")
     scheduler = _fake_scheduler(
-        requests={"cached1": _fake_request(num_computed_tokens=20, num_prompt_tokens=50)},
+        requests={
+            "cached1": _fake_request(num_computed_tokens=20, num_prompt_tokens=50)
+        },
         running=["cached1"],
         waiting=[],
         skipped_waiting=[],
@@ -158,7 +166,9 @@ def test_prefill_decode_split_cached_finished_prompt_counts_as_decode(tmp_path):
     path = tmp_path / "telemetry.jsonl"
     writer = TelemetryWriter(path=path, engine_id="e", model_id="m")
     scheduler = _fake_scheduler(
-        requests={"cached1": _fake_request(num_computed_tokens=50, num_prompt_tokens=50)},
+        requests={
+            "cached1": _fake_request(num_computed_tokens=50, num_prompt_tokens=50)
+        },
         running=["cached1"],
         waiting=[],
         skipped_waiting=[],
@@ -190,8 +200,14 @@ def test_clamped_true_when_effective_differs_from_requested(tmp_path):
     writer.record(scheduler, output, decision)
     writer.close()
     record = json.loads(path.read_text().splitlines()[0])
-    assert record["requested_admission"] == {"max_num_seqs": 999, "max_num_batched_tokens": 999999}
-    assert record["effective_admission"] == {"max_num_seqs": 16, "max_num_batched_tokens": 2048}
+    assert record["requested_admission"] == {
+        "max_num_seqs": 999,
+        "max_num_batched_tokens": 999999,
+    }
+    assert record["effective_admission"] == {
+        "max_num_seqs": 16,
+        "max_num_batched_tokens": 2048,
+    }
     assert record["clamped"] == {"max_num_seqs": True, "max_num_batched_tokens": True}
 
 
@@ -245,7 +261,9 @@ def test_invalid_sample_n_env_var_falls_back_to_default_instead_of_crashing(
 
 
 @pytest.mark.parametrize("bad_value", [0, -1])
-def test_invalid_explicit_sample_n_falls_back_to_default_instead_of_crashing(tmp_path, bad_value):
+def test_invalid_explicit_sample_n_falls_back_to_default_instead_of_crashing(
+    tmp_path, bad_value
+):
     path = tmp_path / "telemetry.jsonl"
     writer = TelemetryWriter(
         path=path, engine_id="e", model_id="m", sample_every_n_steps=bad_value
@@ -291,6 +309,62 @@ def test_write_failure_mid_run_disables_further_writes_instead_of_raising(tmp_pa
     assert len(path.read_text().splitlines()) == 1
 
 
+def test_rotation_triggers_once_size_threshold_exceeded(tmp_path):
+    path = tmp_path / "telemetry.jsonl"
+    # Small enough that a handful of records exceeds it, forcing a rotation.
+    writer = TelemetryWriter(path=path, engine_id="e", model_id="m", max_bytes=300)
+    scheduler = _fake_scheduler(requests={}, running=[], waiting=[], skipped_waiting=[])
+    output = _fake_output(new_req_ids=[], scheduled_tokens={})
+
+    for _ in range(20):
+        writer.record(scheduler, output, _decision())
+    writer.close()
+
+    rotated = sorted(tmp_path.glob("telemetry.jsonl.*"))
+    assert len(rotated) >= 1, "expected at least one rotated file"
+    # The live file still exists and still has valid content.
+    assert path.exists()
+    for line in path.read_text().splitlines():
+        json.loads(line)  # must not raise -- no split/truncated records
+
+
+def test_rotation_never_splits_a_jsonl_record_across_files(tmp_path):
+    path = tmp_path / "telemetry.jsonl"
+    writer = TelemetryWriter(path=path, engine_id="e", model_id="m", max_bytes=300)
+    scheduler = _fake_scheduler(requests={}, running=[], waiting=[], skipped_waiting=[])
+    output = _fake_output(new_req_ids=[], scheduled_tokens={})
+
+    for _ in range(30):
+        writer.record(scheduler, output, _decision())
+    writer.close()
+
+    all_files = [path, *sorted(tmp_path.glob("telemetry.jsonl.*"))]
+    total_lines = 0
+    for f in all_files:
+        for line in f.read_text().splitlines():
+            record = json.loads(line)  # every line in every file parses whole
+            assert record["engine_id"] == "e"
+            total_lines += 1
+    assert total_lines == 30
+
+
+def test_rotation_failure_is_fail_open_write_continues(tmp_path, monkeypatch):
+    path = tmp_path / "telemetry.jsonl"
+    writer = TelemetryWriter(path=path, engine_id="e", model_id="m", max_bytes=1)
+    scheduler = _fake_scheduler(requests={}, running=[], waiting=[], skipped_waiting=[])
+    output = _fake_output(new_req_ids=[], scheduled_tokens={})
+
+    def _raise(*args, **kwargs):
+        raise OSError("rename failed")
+
+    import os as os_module
+
+    monkeypatch.setattr(os_module, "replace", _raise)
+    writer.record(scheduler, output, _decision())  # must not raise
+    writer.record(scheduler, output, _decision())  # must not raise
+    writer.close()
+
+
 def test_stats_construction_failure_is_fail_open_not_just_write_failure(tmp_path):
     # §2 of the canonical contract: "写入、stats 构造、序列化...均 fail-open" --
     # not just the final write/flush. A broken make_stats() must not escape
@@ -302,7 +376,11 @@ def test_stats_construction_failure_is_fail_open_not_just_write_failure(tmp_path
         raise RuntimeError("stats subsystem exploded")
 
     scheduler = _fake_scheduler(
-        requests={}, running=[], waiting=[], skipped_waiting=[], make_stats=_broken_make_stats
+        requests={},
+        running=[],
+        waiting=[],
+        skipped_waiting=[],
+        make_stats=_broken_make_stats,
     )
     output = _fake_output(new_req_ids=[], scheduled_tokens={})
     writer.record(scheduler, output, _decision())  # must not raise
