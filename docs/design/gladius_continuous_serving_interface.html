@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GLADIUS × vLLM 持续 Serving 接口规范</title>
+  <style>
+    :root{color-scheme:light;--ink:#172033;--muted:#586174;--line:#d9deea;--brand:#3157c8;--soft:#f4f7ff}
+    body{max-width:1080px;margin:40px auto;padding:0 24px;font:16px/1.65 system-ui,sans-serif;color:var(--ink)}
+    h1,h2,h3{line-height:1.25} h1{font-size:2rem} h2{margin-top:2.2rem;border-bottom:1px solid var(--line);padding-bottom:.35rem}
+    code,pre{font-family:ui-monospace,SFMono-Regular,monospace} pre{overflow:auto;padding:16px;background:#111827;color:#e5e7eb;border-radius:8px}
+    table{border-collapse:collapse;width:100%;display:block;overflow:auto} th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
+    th{background:var(--soft)} .callout{border-left:4px solid var(--brand);background:var(--soft);padding:12px 16px}
+    .muted{color:var(--muted)} a{color:var(--brand)}
+  </style>
+</head>
+<body>
+<h1>GLADIUS × vLLM 持续 Serving 接口规范</h1>
+<p class="muted">Canonical contract 1.0.0 · 2026-07-31 · 执行端规范来源：<code>gladius_vllm</code></p>
+
+<div class="callout">
+  本文冻结控制面与执行面的文件协议。vLLM fork 不兼容旧的整数
+  <code>schema_version</code>、扁平 <code>admission_limit</code>、
+  <code>GLADIUS_POLICY_PATH</code> 或 <code>GLADIUS_TELEMETRY_PATH</code>。
+  SMIG 必须一次性切换。
+</div>
+
+<h2>1. Canonical policy snapshot</h2>
+<pre>{
+  "schema_version": "1.0.0",
+  "generation": 42,
+  "policy_id": "policy-42",
+  "model_id": "Qwen/Qwen3-8B",
+  "engine_id": "engine-a",
+  "created_at": "2026-07-31T00:00:00Z",
+  "expires_at": "2026-07-31T00:05:00Z",
+  "admission": {
+    "max_num_seqs": 8,
+    "max_num_batched_tokens": 2048
+  }
+}</pre>
+<ul>
+  <li>顶层字段严格匹配；未知或缺失字段均视为 corrupt。</li>
+  <li>publisher 仅写 <code>1.0.0</code>；reader 接受语义版本格式且 major 为 1。</li>
+  <li><code>generation</code> 是非负整数，并按 <code>(engine_id, model_id)</code> 持久化、严格递增。</li>
+  <li>ID 均为非空字符串；snapshot 的 engine/model 必须与执行实例精确匹配。生产必须显式配置稳定的 <code>GLADIUS_ENGINE_ID</code>。</li>
+  <li>时间戳必须带时区，且 <code>expires_at &gt; created_at</code>。</li>
+  <li>两项 admission 只能是正整数或 <code>null</code>；<code>null</code> 表示使用启动 ceiling。</li>
+  <li>发布必须同目录写临时文件、flush/fsync 后原子 replace；执行端不观察半行或半对象。</li>
+</ul>
+
+<h2>2. Telemetry schema</h2>
+<p>每个采样 scheduler step 追加一行 JSON。核心关联字段为
+<code>engine_id/model_id/generation/policy_id/decision_id/window_id/step</code>。
+<code>decision_id</code> 在 1.0 中等于 <code>policy_id</code>；
+执行端无法由 canonical snapshot 得知 <code>window_id</code> 时写 <code>null</code>，
+由 SMIG 发布账本完成 window→decision 映射。</p>
+<pre>{
+  "schema_version": "1.0.0",
+  "engine_id": "engine-a",
+  "model_id": "Qwen/Qwen3-8B",
+  "generation": 42,
+  "policy_id": "policy-42",
+  "decision_id": "policy-42",
+  "window_id": null,
+  "step": 901,
+  "created_at": "2026-07-31T00:01:00Z",
+  "expires_at": null,
+  "num_running_reqs": 8,
+  "num_waiting_reqs": 17,
+  "num_skipped_waiting_reqs": 9,
+  "num_scheduled_reqs": 4,
+  "num_scheduled_tokens": 512,
+  "num_prefill_reqs": 1,
+  "num_decode_reqs": 3,
+  "kv_cache_usage": 0.73,
+  "policy_status": "active",
+  "policy_source": "file",
+  "requested_admission": {"max_num_seqs": 8, "max_num_batched_tokens": 2048},
+  "effective_admission": {"max_num_seqs": 8, "max_num_batched_tokens": 2048},
+  "clamped": {"max_num_seqs": false, "max_num_batched_tokens": false}
+}</pre>
+<p>写入、stats 构造、序列化、flush、close 或轮转失败均 fail-open：不得中断 serving。
+采样率必须为正整数。生产 polling interval 必须大于 0；0 仅允许测试注入。
+轮转保留完整 JSONL 行，不拆分记录。</p>
+
+<h2>3. 状态机与行为矩阵</h2>
+<table>
+<thead><tr><th>输入状态</th><th>存在未过期 last-good</th><th>无可用 last-good</th></tr></thead>
+<tbody>
+<tr><td>missing</td><td colspan="2">回到 startup default</td></tr>
+<tr><td>expired</td><td colspan="2">回到 startup default，状态 expired</td></tr>
+<tr><td>corrupt</td><td>保留 last-good</td><td>startup default，状态 corrupt</td></tr>
+<tr><td>engine/model mismatch</td><td>保留 last-good</td><td>startup default，状态 rejected_engine_mismatch</td></tr>
+<tr><td>generation regression/equal</td><td>保留 last-good</td><td>startup default，状态 rejected_regression</td></tr>
+<tr><td>valid newer generation</td><td colspan="2">接受并替换 active policy</td></tr>
+</tbody>
+</table>
+<p>effective ceiling 始终为 requested 与 startup ceiling 的最小值。
+降低 <code>max_num_seqs</code> 不驱逐运行中请求：先禁止新准入，再随完成自然收敛。
+每步均重新检查 TTL；corrupt 新文件不能使已过期策略复活。</p>
+
+<h2>4. 配置与职责边界</h2>
+<p>唯一目录配置为 <code>GLADIUS_POLICY_DIR</code>，其下固定
+<code>policy_snapshot.json</code> 与 <code>telemetry.jsonl</code>。
+<code>gladius_vllm.scheduler.GladiusScheduler</code> 是唯一有状态 scheduler；
+其他入口只能无状态转发。</p>
+<table>
+<thead><tr><th>SMIG 控制面</th><th>vLLM 执行面</th></tr></thead>
+<tbody>
+<tr><td>窗口特征、候选策略、propensity、选择与 generation high-watermark</td><td>严格解析、ID/TTL/regression 状态机、startup clamp</td></tr>
+<tr><td>原子发布、telemetry 双读归一化、DAG 归因、保留/回放</td><td>真实准入、prefill/decode/KV 观测、fail-open JSONL</td></tr>
+<tr><td>shadow/canary/rollback 与离线 IPS/DR</td><td>不接受梯度直接控制 scheduler</td></tr>
+</tbody>
+</table>
+
+<h2>5. Provenance DAG</h2>
+<pre>WorkloadWindow
+  → CandidateSet
+  → PolicyDecision
+  → PublishedSnapshot
+  → SchedulerStep*
+  → ServingOutcome
+  → RetainedExperience</pre>
+<p>DAG 必须保存连续 workload 特征、共同候选批次、选择 propensity、
+硬件/引擎版本、telemetry step 范围、样本量和 P50/P95/P99。
+未知的离线策略字段保持 <code>null</code>，不得伪造为 <code>false</code> 或 0。</p>
+
+<h2>6. 研究证据、评审边界与验收映射</h2>
+<table>
+<thead><tr><th>工作</th><th>可归属主张</th><th>评审/弱点边界</th><th>GLADIUS 验收项</th></tr></thead>
+<tbody>
+<tr><td><a href="https://openreview.net/forum?id=7JhGdZvW4T">TRAIL（ICLR 2025）</a></td><td>作者提出用中间表示预测剩余长度并反馈调度。</td><td>接收状态与作者材料可核验；动态重训、GPU memory 和多机覆盖不足属于作者讨论，不冒充 reviewer 原话。</td><td>P50/P95/P99、SLO violation、bucket/参数敏感性、跨模型泛化。</td></tr>
+<tr><td><a href="https://openreview.net/forum?id=cQxLCVa9u7">HyGen（NeurIPS 2025 poster）</a></td><td>作者主张延迟预测、SLO profiler 与在线/离线共置。</td><td>公开页可核验 poster；动态/OOD、单模型与 workload 覆盖限制按作者材料归属。</td><td>跨模型/GPU/显存、约 8× burst、OOD、20% MAPE、异步更新、无运行时 warm-up。</td></tr>
+<tr><td><a href="https://papers.neurips.cc/paper_files/paper/2019/file/fa7cdfad1a5aaf8370ebeda47a1ff1c3-Reviews.html">CLEAR reviews</a> / <a href="https://papers.neurips.cc/paper_files/paper/2019/file/fa7cdfad1a5aaf8370ebeda47a1ff1c3-MetaReview.html">meta-review</a></td><td>off-policy replay 与行为克隆平衡稳定性/可塑性。</td><td>reviewer 肯定结果与消融，也质疑新颖性、任务数、buffer/比例敏感性；meta-review 接收并要求补敏感性与表示分析。</td><td>buffer 容量、new/replay 比例、冲突经验、漂移、off-policy 修正、负迁移。</td></tr>
+</tbody>
+</table>
+
+<h2>7. P0–P4 路线与完成定义</h2>
+<ol>
+  <li><strong>P0</strong>：本文、公共 parser、共享 golden fixtures。</li>
+  <li><strong>P1</strong>：双 ceiling scheduler、never-raises telemetry、SMIG canonical adapter。</li>
+  <li><strong>P2</strong>：Provenance DAG、严格窗口归因与真实跨仓闭环。</li>
+  <li><strong>P3</strong>：约束 replay、IPS/DR、shadow、canary、rollback。</li>
+  <li><strong>P4</strong>：TRAIL 风格 residual-length predictor 与 HyGen 风格 profiler。</li>
+</ol>
+<p>可微 world model 只离线生成候选；梯度不得直接控制生产 scheduler。
+任何真实 SLO、GPU smoke 或跨仓契约未通过时，都不得宣称持续学习 serving 闭环完成。</p>
+
+<h2>8. 测试证据与未解决风险</h2>
+<p>冻结测试覆盖 valid、非对象 JSON、坏 SemVer、naive timestamp、未知 admission、
+engine/model mismatch、generation regression、expired 与原子替换；scheduler 覆盖 startup
+等价、双 clamp、渐进收缩、last-good/expired 回退和 telemetry fail-open。
+真实 engine/GPU、轮转压力、跨模型硬件矩阵和长时 SLO 仍是发布门禁，不以纯 Python 单测替代。</p>
+
+<h2>9. 下一同步目标（P0 → P1）</h2>
+<div class="callout">
+  下一次两仓同步的唯一目标是：以本页 canonical snapshot 为共享 contract，
+  vLLM 暴露公共 <code>parse_policy_snapshot()</code> 并补齐 last-good/telemetry
+  fail-safe；SMIG 同时切换 publisher 与 telemetry adapter。两仓共同使用同一组
+  golden fixtures，通过 valid、SemVer、ID mismatch、regression、expired 和原子替换
+  契约测试后，再进入 Provenance DAG。
+</div>
+<p>同步交付物：vLLM 公共 parser 与唯一 scheduler 状态机、requested/effective telemetry；
+SMIG 的 <code>(engine_id, model_id)</code> generation high-watermark 和新旧 telemetry 双读。
+本目标不包含 residual-length predictor、HyGen profiler 或可微 world model。</p>
+</body>
+</html>
