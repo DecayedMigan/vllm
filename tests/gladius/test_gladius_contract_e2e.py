@@ -18,11 +18,10 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.pop("ALL_PROXY", None)
-os.environ.pop("all_proxy", None)
-
 import pytest
+
+# See tests/gladius/conftest.py for the autouse HF_HUB_OFFLINE/no-proxy
+# fixture required before any vllm config object is constructed.
 
 MODEL = "Qwen/Qwen3-1.7B"
 

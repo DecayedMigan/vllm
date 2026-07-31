@@ -6,6 +6,8 @@ TelemetryWriter only duck-types on a handful of attributes.
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from gladius_vllm.policy import PolicyDecision
 from gladius_vllm.telemetry import TelemetryWriter
 
@@ -210,3 +212,64 @@ def test_expires_at_is_always_null(tmp_path):
     writer.close()
     record = json.loads(path.read_text().splitlines()[0])
     assert record["expires_at"] is None
+
+
+@pytest.mark.parametrize("bad_value", ["not-an-int", "0", "-3", ""])
+def test_invalid_sample_n_env_var_falls_back_to_default_instead_of_crashing(
+    tmp_path, monkeypatch, bad_value
+):
+    monkeypatch.setenv("GLADIUS_TELEMETRY_SAMPLE_N", bad_value)
+    path = tmp_path / "telemetry.jsonl"
+    writer = TelemetryWriter(path=path, engine_id="e", model_id="m")  # must not raise
+    scheduler = _fake_scheduler(requests={}, running=[], waiting=[], skipped_waiting=[])
+    output = _fake_output(new_req_ids=[], scheduled_tokens={})
+    writer.record(scheduler, output, _decision())  # must not ZeroDivisionError
+    writer.close()
+    assert len(path.read_text().splitlines()) == 1
+
+
+@pytest.mark.parametrize("bad_value", [0, -1])
+def test_invalid_explicit_sample_n_falls_back_to_default_instead_of_crashing(tmp_path, bad_value):
+    path = tmp_path / "telemetry.jsonl"
+    writer = TelemetryWriter(
+        path=path, engine_id="e", model_id="m", sample_every_n_steps=bad_value
+    )
+    scheduler = _fake_scheduler(requests={}, running=[], waiting=[], skipped_waiting=[])
+    output = _fake_output(new_req_ids=[], scheduled_tokens={})
+    writer.record(scheduler, output, _decision())  # must not ZeroDivisionError
+    writer.close()
+    assert len(path.read_text().splitlines()) == 1
+
+
+def test_unwritable_directory_disables_telemetry_instead_of_raising(tmp_path):
+    # Make the parent a file, not a directory, so mkdir/open both fail with
+    # OSError -- construction must not raise; it should just disable writes.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    path = blocker / "nested" / "telemetry.jsonl"
+
+    writer = TelemetryWriter(path=path, engine_id="e", model_id="m")  # must not raise
+    scheduler = _fake_scheduler(requests={}, running=[], waiting=[], skipped_waiting=[])
+    output = _fake_output(new_req_ids=[], scheduled_tokens={})
+    writer.record(scheduler, output, _decision())  # must not raise
+    writer.close()  # must not raise
+
+
+def test_write_failure_mid_run_disables_further_writes_instead_of_raising(tmp_path):
+    path = tmp_path / "telemetry.jsonl"
+    writer = TelemetryWriter(path=path, engine_id="e", model_id="m")
+    scheduler = _fake_scheduler(requests={}, running=[], waiting=[], skipped_waiting=[])
+    output = _fake_output(new_req_ids=[], scheduled_tokens={})
+    writer.record(scheduler, output, _decision())
+    assert len(path.read_text().splitlines()) == 1
+
+    def _raise(*args, **kwargs):
+        raise OSError("disk full")
+
+    writer._file.write = _raise
+    writer.record(scheduler, output, _decision())  # must not raise
+    assert writer._file is None
+
+    # Telemetry stays disabled (no crash) on subsequent calls too.
+    writer.record(scheduler, output, _decision())
+    assert len(path.read_text().splitlines()) == 1

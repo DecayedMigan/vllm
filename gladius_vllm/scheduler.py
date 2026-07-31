@@ -30,6 +30,7 @@ from gladius_vllm.policy import PolicyLoader
 from gladius_vllm.registry import register_scheduler
 from gladius_vllm.schema import (
     DEFAULT_POLICY_POLL_INTERVAL_MS,
+    parse_int_env,
     resolve_engine_id,
     resolve_model_id,
 )
@@ -68,9 +69,8 @@ class GladiusScheduler(Scheduler):
 
         policy_dir_env = os.environ.get("GLADIUS_POLICY_DIR")
         policy_dir = Path(policy_dir_env) if policy_dir_env else None
-        poll_interval_env = os.environ.get("GLADIUS_POLICY_POLL_INTERVAL_MS")
-        poll_interval_ms = (
-            int(poll_interval_env) if poll_interval_env else DEFAULT_POLICY_POLL_INTERVAL_MS
+        poll_interval_ms = parse_int_env(
+            "GLADIUS_POLICY_POLL_INTERVAL_MS", DEFAULT_POLICY_POLL_INTERVAL_MS, minimum=0
         )
 
         self._policy_loader = PolicyLoader(

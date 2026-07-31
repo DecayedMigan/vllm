@@ -286,3 +286,47 @@ def test_expires_at_before_created_at_rejected(tmp_path):
     loader = _loader(path)
     decision = loader.poll()
     assert decision.status == "corrupt"
+
+
+@pytest.mark.parametrize("payload", [None, [], 42, "just a string"])
+def test_non_object_json_payload_rejected_as_corrupt(tmp_path, payload):
+    path = tmp_path / "policy_snapshot.json"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload))
+    os.replace(tmp, path)
+    loader = _loader(path)
+    decision = loader.poll()  # must not raise
+    assert decision.status == "corrupt"
+    assert decision.source == "default"
+
+
+def test_naive_created_at_rejected_as_corrupt(tmp_path):
+    path = tmp_path / "policy_snapshot.json"
+    now = datetime.now(timezone.utc)
+    _write(
+        path,
+        created_at=now.replace(tzinfo=None).isoformat(),  # naive, no timezone
+        expires_at=(now + timedelta(seconds=30)).isoformat().replace("+00:00", "Z"),
+    )
+    loader = _loader(path)
+    decision = loader.poll()  # must not raise ValueError from naive-timestamp parsing
+    assert decision.status == "corrupt"
+
+
+def test_naive_expires_at_rejected_as_corrupt_not_crash_on_later_expiry_check(tmp_path):
+    # A naive expires_at that slipped past parsing would later crash
+    # PolicyLoader._is_expired()'s aware-vs-naive comparison; it must be
+    # rejected up front instead.
+    path = tmp_path / "policy_snapshot.json"
+    now = datetime.now(timezone.utc)
+    _write(
+        path,
+        created_at=now.isoformat().replace("+00:00", "Z"),
+        expires_at=(now + timedelta(seconds=30)).replace(tzinfo=None).isoformat(),
+    )
+    loader = _loader(path)
+    decision = loader.poll()
+    assert decision.status == "corrupt"
+    # Re-polling must not raise even though nothing valid was ever accepted.
+    decision = loader.poll()
+    assert decision.status in ("corrupt", "no_policy")

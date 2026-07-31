@@ -13,18 +13,14 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 
-# Requires network-derived HF metadata to be avoided: the cached model below
-# is already on disk, but ModelConfig construction still eagerly builds an
-# HTTP client that fails validation against a SOCKS proxy URL scheme unless
-# these are set before any vllm config object is constructed.
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.pop("ALL_PROXY", None)
-os.environ.pop("all_proxy", None)
-
 import pytest
 
 from tests.v1.core.utils import create_requests, create_scheduler
 from gladius_vllm.scheduler import GladiusScheduler
+
+# See tests/gladius/conftest.py for the autouse HF_HUB_OFFLINE/no-proxy
+# fixture required before any vllm config object (e.g. create_scheduler())
+# is constructed.
 
 MODEL = "Qwen/Qwen3-1.7B"  # already present in the local HF cache
 
@@ -282,3 +278,13 @@ def test_engine_degrades_when_policy_expires_mid_run(tmp_path, monkeypatch):
     time.sleep(0.15)
     gladius.schedule()
     assert gladius.max_num_running_reqs == gladius.startup_max_num_seqs == 16
+
+
+@pytest.mark.parametrize("bad_value", ["not-an-int", "-5"])
+def test_invalid_poll_interval_env_var_falls_back_instead_of_crashing_startup(
+    monkeypatch, bad_value
+):
+    monkeypatch.setenv("GLADIUS_POLICY_POLL_INTERVAL_MS", bad_value)
+    vanilla = create_scheduler(model=MODEL, max_num_seqs=16, max_num_batched_tokens=8192)
+    gladius = _build_gladius_scheduler(vanilla)  # must not raise
+    assert gladius._policy_loader is not None
