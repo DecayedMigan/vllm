@@ -78,11 +78,34 @@
   "policy_source": "file",
   "requested_admission": {"max_num_seqs": 8, "max_num_batched_tokens": 2048},
   "effective_admission": {"max_num_seqs": 8, "max_num_batched_tokens": 2048},
-  "clamped": {"max_num_seqs": false, "max_num_batched_tokens": false}
+  "clamped": {"max_num_seqs": false, "max_num_batched_tokens": false},
+  "policy_poll_ns": 1100,
+  "policy_apply_ns": 900,
+  "telemetry_write_ns": 17000
 }</pre>
 <p>写入、stats 构造、序列化、flush、close 或轮转失败均 fail-open：不得中断 serving。
 采样率必须为正整数。生产 polling interval 必须大于 0；0 仅允许测试注入。
 轮转保留完整 JSONL 行，不拆分记录。</p>
+
+<h2>2.1 Policy application acknowledgement</h2>
+<p>执行端首次观察到新 generation，或同一 generation 从渐进收缩转为完全生效时，
+原子更新 <code>policy_application.json</code>。状态仅允许
+<code>active</code>、<code>attriting</code> 与 <code>fallback</code>；确认写入失败保持
+serving fail-open，但对应实验窗口不得进入学习经验。</p>
+<pre>{
+  "schema_version": "1.0.0",
+  "engine_id": "engine-a",
+  "model_id": "Qwen/Qwen3-8B",
+  "generation": 42,
+  "policy_id": "policy-42",
+  "decision_id": "policy-42",
+  "observed_at": "2026-07-31T00:00:30Z",
+  "scheduler_step": 901,
+  "state": "active",
+  "requested_admission": {"max_num_seqs": 8, "max_num_batched_tokens": 2048},
+  "effective_admission": {"max_num_seqs": 8, "max_num_batched_tokens": 2048},
+  "clamped": {"max_num_seqs": false, "max_num_batched_tokens": false}
+}</pre>
 
 <h2>3. 状态机与行为矩阵</h2>
 <table>
@@ -102,7 +125,8 @@
 
 <h2>4. 配置与职责边界</h2>
 <p>唯一目录配置为 <code>GLADIUS_POLICY_DIR</code>，其下固定
-<code>policy_snapshot.json</code> 与 <code>telemetry.jsonl</code>。
+<code>policy_snapshot.json</code>、<code>policy_application.json</code> 与
+<code>telemetry.jsonl</code>。
 <code>gladius_vllm.scheduler.GladiusScheduler</code> 是唯一有状态 scheduler；
 其他入口只能无状态转发。</p>
 <table>
@@ -119,6 +143,7 @@
   → CandidateSet
   → PolicyDecision
   → PublishedSnapshot
+  → PolicyApplication
   → SchedulerStep*
   → ServingOutcome
   → RetainedExperience</pre>

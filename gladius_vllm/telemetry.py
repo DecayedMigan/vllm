@@ -9,9 +9,11 @@ ambiguity. See gladius_vllm.stat_logger for the optional secondary path.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
+import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -94,6 +96,8 @@ class TelemetryWriter:
         self._max_bytes = _resolve_max_bytes(max_bytes)
         self._step = 0
         self._rotation_count = 0
+        self._last_write_ns = 0
+        self._sealed = False
         self._file = None
         if self._path is not None:
             try:
@@ -151,8 +155,13 @@ class TelemetryWriter:
         scheduler: Any,
         output: SchedulerOutput,
         decision: PolicyDecision,
+        *,
+        policy_poll_ns: int = 0,
+        policy_apply_ns: int = 0,
     ) -> None:
         self._step += 1
+        if self._sealed:
+            return
         if self._file is None:
             return
         if self._step % self._sample_every_n_steps != 0:
@@ -224,9 +233,17 @@ class TelemetryWriter:
                 "requested_admission": requested_admission,
                 "effective_admission": effective_admission,
                 "clamped": clamped,
+                "policy_poll_ns": max(0, int(policy_poll_ns)),
+                "policy_apply_ns": max(0, int(policy_apply_ns)),
+                # Writing this record has not completed yet. Report the
+                # previous sampled emission's measured serialization/write/
+                # flush duration so the stream remains append-only.
+                "telemetry_write_ns": self._last_write_ns,
             }
+            write_started = time.perf_counter_ns()
             self._file.write(json.dumps(record) + "\n")
             self._file.flush()
+            self._last_write_ns = time.perf_counter_ns() - write_started
         except Exception:
             logger.warning(
                 "GLADIUS telemetry disabled at step %d: record/write failed",
@@ -242,3 +259,64 @@ class TelemetryWriter:
             with contextlib.suppress(OSError):
                 self._file.close()
             self._file = None
+
+    def seal(self, manifest_path: Path) -> bool:
+        """Close and atomically certify this writer's telemetry segments."""
+        self._sealed = True
+        self.close()
+        if self._path is None:
+            return False
+        temporary_path: Path | None = None
+        try:
+            rotated = sorted(self._path.parent.glob(f"{self._path.name}.*-*"))
+            files = [*rotated]
+            if self._path.is_file():
+                files.append(self._path)
+            manifest = {
+                "schema_version": SCHEMA_VERSION,
+                "engine_id": self._engine_id,
+                "model_id": self._model_id,
+                "sealed_at": format_iso8601(),
+                "final_scheduler_step": self._step,
+                "files": [
+                    {
+                        "name": path.name,
+                        "size": path.stat().st_size,
+                        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    }
+                    for path in files
+                ],
+            }
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=manifest_path.parent,
+                prefix=f".{manifest_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+                json.dump(manifest, handle, sort_keys=True, separators=(",", ":"))
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, manifest_path)
+            temporary_path = None
+            return True
+        except Exception:
+            logger.warning(
+                "GLADIUS telemetry seal failed for %s",
+                self._path,
+                exc_info=True,
+            )
+            return False
+        finally:
+            if temporary_path is not None:
+                with contextlib.suppress(OSError):
+                    temporary_path.unlink(missing_ok=True)
+
+    @property
+    def step(self) -> int:
+        """Latest scheduler-step identity, including unsampled steps."""
+        return self._step

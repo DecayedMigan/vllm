@@ -36,6 +36,23 @@
     "policy_source": "file",
     "requested_admission": {"max_num_seqs": 8, "max_num_batched_tokens": 2048},
     "effective_admission": {"max_num_seqs": 8, "max_num_batched_tokens": 2048},
+    "clamped": {"max_num_seqs": false, "max_num_batched_tokens": false},
+    "policy_poll_ns": 1100,
+    "policy_apply_ns": 900,
+    "telemetry_write_ns": 17000
+  },
+  "valid_policy_application": {
+    "schema_version": "1.0.0",
+    "engine_id": "engine-a",
+    "model_id": "Qwen/Qwen3-8B",
+    "generation": 42,
+    "policy_id": "policy-42",
+    "decision_id": "policy-42",
+    "observed_at": "2026-07-31T00:00:30Z",
+    "scheduler_step": 901,
+    "state": "active",
+    "requested_admission": {"max_num_seqs": 8, "max_num_batched_tokens": 2048},
+    "effective_admission": {"max_num_seqs": 8, "max_num_batched_tokens": 2048},
     "clamped": {"max_num_seqs": false, "max_num_batched_tokens": false}
   },
   "invalid_snapshots": [

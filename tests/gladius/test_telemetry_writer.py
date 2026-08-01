@@ -35,6 +35,9 @@ EXPECTED_FIELDS = {
     "requested_admission",
     "effective_admission",
     "clamped",
+    "policy_poll_ns",
+    "policy_apply_ns",
+    "telemetry_write_ns",
 }
 
 
@@ -104,7 +107,13 @@ def test_writes_one_valid_json_line_with_all_fields(tmp_path):
         skipped_waiting=[],
     )
     output = _fake_output(new_req_ids=["r1"], scheduled_tokens={"r1": 1})
-    writer.record(scheduler, output, _decision())
+    writer.record(
+        scheduler,
+        output,
+        _decision(),
+        policy_poll_ns=11,
+        policy_apply_ns=13,
+    )
     writer.close()
 
     lines = path.read_text().splitlines()
@@ -124,6 +133,9 @@ def test_writes_one_valid_json_line_with_all_fields(tmp_path):
         "max_num_batched_tokens": 4096,
     }
     assert record["clamped"] == {"max_num_seqs": False, "max_num_batched_tokens": False}
+    assert record["policy_poll_ns"] == 11
+    assert record["policy_apply_ns"] == 13
+    assert record["telemetry_write_ns"] >= 0
 
 
 def test_prefill_decode_split_new_request_counts_as_prefill(tmp_path):
@@ -386,3 +398,25 @@ def test_stats_construction_failure_is_fail_open_not_just_write_failure(tmp_path
     writer.record(scheduler, output, _decision())  # must not raise
     assert writer._file is None
     assert path.read_text() == ""
+
+
+def test_seal_hashes_telemetry_and_blocks_later_mutation(tmp_path):
+    path = tmp_path / "telemetry.jsonl"
+    manifest_path = tmp_path / "telemetry_seal.json"
+    writer = TelemetryWriter(path=path, engine_id="e", model_id="m")
+    scheduler = _fake_scheduler(requests={}, running=[], waiting=[], skipped_waiting=[])
+    output = _fake_output(new_req_ids=[], scheduled_tokens={})
+    writer.record(scheduler, output, _decision())
+    certified_bytes = path.read_bytes()
+
+    assert writer.seal(manifest_path) is True
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["schema_version"] == "1.0.0"
+    assert manifest["engine_id"] == "e"
+    assert manifest["model_id"] == "m"
+    assert manifest["final_scheduler_step"] == 1
+    assert [item["name"] for item in manifest["files"]] == ["telemetry.jsonl"]
+    assert len(manifest["files"][0]["sha256"]) == 64
+
+    writer.record(scheduler, output, _decision())
+    assert path.read_bytes() == certified_bytes

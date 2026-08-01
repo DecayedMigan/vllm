@@ -21,9 +21,11 @@ plumbing, to keep this a pure additive plugin):
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from gladius_vllm.application import PolicyApplicationWriter
 from gladius_vllm.policy import PolicyLoader
 from gladius_vllm.registry import register_scheduler
 from gladius_vllm.schema import (
@@ -40,6 +42,7 @@ if TYPE_CHECKING:
 
 POLICY_SNAPSHOT_FILENAME = "policy_snapshot.json"
 TELEMETRY_FILENAME = "telemetry.jsonl"
+POLICY_APPLICATION_FILENAME = "policy_application.json"
 
 
 def _resolve_poll_interval_ms() -> int:
@@ -99,6 +102,15 @@ class GladiusScheduler(Scheduler):
             engine_id=self.engine_id,
             model_id=self.model_id,
         )
+        self._application_writer = PolicyApplicationWriter(
+            path=(
+                policy_dir / POLICY_APPLICATION_FILENAME
+                if policy_dir
+                else None
+            ),
+            engine_id=self.engine_id,
+            model_id=self.model_id,
+        )
 
         register_scheduler(self)
 
@@ -109,7 +121,10 @@ class GladiusScheduler(Scheduler):
         # `throttle_prefills` positional) -- see
         # docs/design/gladius_next_steps_h100.md P0-A. Hard-coding either
         # shape breaks the plugin on the other version.
+        poll_started = time.perf_counter_ns()
         decision = self._policy_loader.poll()
+        policy_poll_ns = time.perf_counter_ns() - poll_started
+        apply_started = time.perf_counter_ns()
         target_max_num_seqs = min(decision.max_num_seqs, self.startup_max_num_seqs)
         # Never shrink below the number of requests already admitted: the
         # base Scheduler enforces `len(self.running) <= max_num_running_reqs`
@@ -122,11 +137,28 @@ class GladiusScheduler(Scheduler):
         self.max_num_scheduled_tokens = min(
             decision.max_num_batched_tokens, self.startup_max_num_batched_tokens
         )
+        policy_apply_ns = time.perf_counter_ns() - apply_started
 
         output = super().schedule(*args, **kwargs)
 
-        self._telemetry_writer.record(self, output, decision)
+        self._telemetry_writer.record(
+            self,
+            output,
+            decision,
+            policy_poll_ns=policy_poll_ns,
+            policy_apply_ns=policy_apply_ns,
+        )
+        self._application_writer.record(
+            decision,
+            scheduler_step=self._telemetry_writer.step,
+            effective_max_num_seqs=self.max_num_running_reqs,
+            effective_max_num_batched_tokens=self.max_num_scheduled_tokens,
+        )
         return output
+
+    def seal_telemetry(self, manifest_path: Path) -> bool:
+        """Certify the current experiment stream and reject later writes."""
+        return self._telemetry_writer.seal(manifest_path)
 
     def shutdown(self) -> None:
         self._telemetry_writer.close()

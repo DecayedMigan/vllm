@@ -176,6 +176,41 @@ def test_policy_lowering_token_budget_changes_scheduled_tokens(tmp_path, monkeyp
     assert output.total_num_scheduled_tokens <= 64
 
 
+def test_schedule_publishes_matching_policy_application(tmp_path, monkeypatch):
+    monkeypatch.setenv("GLADIUS_POLICY_DIR", str(tmp_path))
+    vanilla = create_scheduler(
+        model=MODEL, max_num_seqs=16, max_num_batched_tokens=8192
+    )
+    gladius = _build_gladius_scheduler(vanilla)
+    _write_snapshot(
+        tmp_path,
+        engine_id=gladius.engine_id,
+        model_id=gladius.model_id,
+        generation=7,
+        max_num_seqs=4,
+        max_num_batched_tokens=2048,
+    )
+    for req in create_requests(num_requests=8, num_tokens=10, max_tokens=8):
+        gladius.add_request(req)
+
+    gladius.schedule()
+
+    application = json.loads(
+        (tmp_path / "policy_application.json").read_text(encoding="utf-8")
+    )
+    assert application["generation"] == 7
+    assert application["policy_id"] == "policy-7"
+    assert application["state"] == "active"
+    assert application["scheduler_step"] == 1
+    assert application["requested_admission"] == {
+        "max_num_seqs": 4,
+        "max_num_batched_tokens": 2048,
+    }
+    assert application["effective_admission"] == application[
+        "requested_admission"
+    ]
+
+
 def test_policy_above_startup_ceiling_is_clamped_not_applied(tmp_path, monkeypatch):
     monkeypatch.setenv("GLADIUS_POLICY_DIR", str(tmp_path))
 

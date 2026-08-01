@@ -117,7 +117,10 @@ telemetry_write_ns
 
 Timing failures or serialization failures remain fail-open. Sampling and
 size-based rotation remain enabled. The execution-plane P95 overhead target is
-at most 1 ms per sampled scheduler step on H100.
+at most 1 ms per sampled scheduler step on H100. Because JSONL is append-only,
+`telemetry_write_ns` on step N reports the completed duration of the previous
+sampled emission; the first sampled record reports zero. Analysis shifts that
+field by one sample before calculating write-overhead percentiles.
 
 Completed experiment data must not share a live writer with keepalive traffic.
 The writer therefore exposes a lifecycle operation that:
