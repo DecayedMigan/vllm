@@ -239,7 +239,7 @@ class PolicyLoader:
         self._startup_max_num_batched_tokens = startup_max_num_batched_tokens
         self._poll_interval_s = poll_interval_ms / 1000.0
 
-        self._last_stat: tuple[int, int] | None = None  # (mtime_ns, size)
+        self._last_stat: tuple[int, int, int] | None = None  # (mtime_ns, size, inode)
         self._last_poll_monotonic: float | None = None
         self._last_accepted_generation: int | None = None
         self._last_accepted_policy_id: str | None = None
@@ -275,7 +275,13 @@ class PolicyLoader:
             # reverting to native/default as if no policy were intended.
             return self._reject_keep_last_or_default("corrupt")
 
-        current_stat = (stat.st_mtime_ns, stat.st_size)
+        # Inode is part of the fingerprint, not just mtime/size: an atomic
+        # os.replace() publish can land on a new inode with identical
+        # mtime_ns/size (same content length, filesystem timestamp
+        # resolution too coarse to differ) -- observed on HPC filesystems,
+        # see docs/design/gladius_next_steps_h100.md P0-B. Without inode,
+        # such a replacement is misread as "unchanged" and never reparsed.
+        current_stat = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
         if current_stat == self._last_stat:
             return self._check_expiry_only()
 

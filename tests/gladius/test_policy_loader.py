@@ -229,6 +229,56 @@ def test_unchanged_file_skips_reparse(tmp_path, monkeypatch):
     assert call_count["n"] == 0
 
 
+def test_same_mtime_and_size_but_different_inode_is_reparsed(tmp_path, monkeypatch):
+    # Regression for docs/design/gladius_next_steps_h100.md P0-B: on some
+    # HPC filesystems, an atomic os.replace() publish can produce a new file
+    # with identical mtime_ns/size (same content length, timestamp
+    # resolution too coarse to differ) but a different inode. The
+    # fingerprint must include inode so this is still detected as a change
+    # instead of being silently skipped as "unchanged".
+    path = tmp_path / "policy_snapshot.json"
+    _write(path, generation=5)
+    loader = _loader(path)
+    first = loader.poll()
+    assert first.generation == 5
+
+    real_stat_result = path.stat()
+    real_stat = Path.stat
+
+    class _FakeStat:
+        st_mtime_ns = real_stat_result.st_mtime_ns
+        st_size = real_stat_result.st_size
+        st_ino = real_stat_result.st_ino + 1  # different inode, same mtime/size
+
+    def fake_stat(self, *args, **kwargs):
+        if self == path:
+            return _FakeStat()
+        return real_stat(self, *args, **kwargs)
+
+    _write(path, generation=6)  # simulates a real atomic replace on disk
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    decision = loader.poll()
+    assert decision.generation == 6  # reparsed and accepted despite same mtime/size
+
+
+def test_truly_unchanged_inode_mtime_size_still_skips_reparse(tmp_path, monkeypatch):
+    path = tmp_path / "policy_snapshot.json"
+    _write(path)
+    loader = _loader(path)
+    loader.poll()
+
+    real_read_text = Path.read_text
+    call_count = {"n": 0}
+
+    def counting_read_text(self, *args, **kwargs):
+        call_count["n"] += 1
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counting_read_text)
+    loader.poll()  # no write in between -- genuinely unchanged inode/mtime/size
+    assert call_count["n"] == 0
+
+
 def test_schema_version_major_mismatch_rejected(tmp_path):
     path = tmp_path / "policy_snapshot.json"
     _write(path, schema_version="2.0.0")

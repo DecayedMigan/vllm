@@ -16,13 +16,14 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from gladius_vllm.scheduler import GladiusScheduler
+from tests.gladius._test_model import resolve_test_model
 from tests.v1.core.utils import create_requests, create_scheduler
 
 # See tests/gladius/conftest.py for the autouse HF_HUB_OFFLINE/no-proxy
 # fixture required before any vllm config object (e.g. create_scheduler())
 # is constructed.
 
-MODEL = "Qwen/Qwen3-1.7B"  # already present in the local HF cache
+MODEL = resolve_test_model()  # override via GLADIUS_TEST_MODEL, e.g. for offline hosts
 
 
 def _write_snapshot(
@@ -334,3 +335,57 @@ def test_invalid_poll_interval_env_var_falls_back_instead_of_crashing_startup(
     )
     gladius = _build_gladius_scheduler(vanilla)  # must not raise
     assert gladius._policy_loader is not None
+
+
+def test_schedule_forwards_call_args_for_cross_version_compat(monkeypatch):
+    # Different vLLM versions call Scheduler.schedule() with different
+    # signatures (some zero-arg, some with a `throttle_prefills` positional
+    # -- see docs/design/gladius_next_steps_h100.md P0-A). GladiusScheduler
+    # must forward whatever it's given rather than assuming one fixed shape.
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    vanilla = create_scheduler(
+        model=MODEL, max_num_seqs=16, max_num_batched_tokens=8192
+    )
+    gladius = _build_gladius_scheduler(vanilla)
+
+    real_schedule = Scheduler.schedule
+    calls = []
+
+    def fake_base_schedule(self, *args, **kwargs):
+        calls.append((args, kwargs))
+        return real_schedule(self)
+
+    monkeypatch.setattr(Scheduler, "schedule", fake_base_schedule)
+
+    for req in create_requests(num_requests=2, num_tokens=10, max_tokens=4):
+        gladius.add_request(req)
+
+    gladius.schedule()  # zero-arg call shape
+    gladius.schedule(True)  # one-arg call shape (e.g. throttle_prefills)
+
+    assert calls == [((), {}), ((True,), {})]
+
+
+def test_schedule_clamp_and_telemetry_run_exactly_once_per_call_shape(
+    tmp_path, monkeypatch
+):
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    monkeypatch.setenv("GLADIUS_POLICY_DIR", str(tmp_path))
+    real_schedule = Scheduler.schedule
+    monkeypatch.setattr(
+        Scheduler, "schedule", lambda self, *a, **kw: real_schedule(self)
+    )
+
+    vanilla = create_scheduler(
+        model=MODEL, max_num_seqs=16, max_num_batched_tokens=8192
+    )
+    gladius = _build_gladius_scheduler(vanilla)
+    for req in create_requests(num_requests=2, num_tokens=10, max_tokens=4):
+        gladius.add_request(req)
+
+    gladius.schedule()
+    assert gladius._telemetry_writer._step == 1
+    gladius.schedule(True)
+    assert gladius._telemetry_writer._step == 2

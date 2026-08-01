@@ -28,10 +28,12 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from tests.gladius._test_model import resolve_test_model
+
 # See tests/gladius/conftest.py for the autouse HF_HUB_OFFLINE/no-proxy
 # fixture required before any vllm config object is constructed.
 
-MODEL = "Qwen/Qwen3-1.7B"  # small model per the doc -- avoid loading 8B first
+MODEL = resolve_test_model()  # override via GLADIUS_TEST_MODEL, e.g. for offline hosts
 STARTUP_MAX_NUM_SEQS = 16
 STARTUP_MAX_NUM_BATCHED_TOKENS = 4096
 POLL_INTERVAL_MS = 100  # production-realistic, per the doc -- not the 0ms test hook

@@ -20,10 +20,12 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from tests.gladius._test_model import resolve_test_model
+
 # See tests/gladius/conftest.py for the autouse HF_HUB_OFFLINE/no-proxy
 # fixture required before any vllm config object is constructed.
 
-MODEL = "Qwen/Qwen3-1.7B"
+MODEL = resolve_test_model()  # override via GLADIUS_TEST_MODEL, e.g. for offline hosts
 
 
 def _write_snapshot(

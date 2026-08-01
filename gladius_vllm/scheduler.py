@@ -102,7 +102,13 @@ class GladiusScheduler(Scheduler):
 
         register_scheduler(self)
 
-    def schedule(self) -> SchedulerOutput:
+    def schedule(self, *args: object, **kwargs: object) -> SchedulerOutput:
+        # Forward whatever the active vLLM runtime supplies rather than
+        # assuming a fixed base signature: different vLLM versions call
+        # Scheduler.schedule() differently (some zero-arg, some with a
+        # `throttle_prefills` positional) -- see
+        # docs/design/gladius_next_steps_h100.md P0-A. Hard-coding either
+        # shape breaks the plugin on the other version.
         decision = self._policy_loader.poll()
         target_max_num_seqs = min(decision.max_num_seqs, self.startup_max_num_seqs)
         # Never shrink below the number of requests already admitted: the
@@ -117,7 +123,7 @@ class GladiusScheduler(Scheduler):
             decision.max_num_batched_tokens, self.startup_max_num_batched_tokens
         )
 
-        output = super().schedule()
+        output = super().schedule(*args, **kwargs)
 
         self._telemetry_writer.record(self, output, decision)
         return output
