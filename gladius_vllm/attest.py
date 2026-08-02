@@ -19,91 +19,28 @@ from __future__ import annotations
 
 import argparse
 import json
-import socket
 import sys
 import time
 from pathlib import Path
 
+from gladius_vllm.digest import sha256_file
+from gladius_vllm.netowner import SocketOwnerError, listen_socket_owner_pid
 from gladius_vllm.receipt import (
     DeploymentExpectation,
     ReceiptError,
     assemble_server_start_receipt,
     read_server_start_receipt,
     verify_receipt_against_deployment,
-    verify_server_start_receipt,
+)
+from gladius_vllm.seal_lifecycle import (
+    ACK_SEALED,
+    SealRequestError,
+    read_seal_ack,
+    write_seal_request,
 )
 
 _EXIT_OK = 0
 _EXIT_INVALID = 1
-
-
-def _listen_socket_owner_pid(host: str, port: int) -> int:
-    """Find the PID that holds the listening socket for `host:port`.
-
-    Parsed from /proc rather than taken on trust from a `--api-pid` flag: the
-    point of the API-side contribution is to prove that the attested process
-    is the one actually serving the endpoint the campaign will call.
-    """
-    inodes = _listening_inodes(host, port)
-    if not inodes:
-        raise ReceiptError(f"no process is listening on {host}:{port}")
-    for pid_dir in Path("/proc").iterdir():
-        if not pid_dir.name.isdigit():
-            continue
-        fd_dir = pid_dir / "fd"
-        try:
-            descriptors = list(fd_dir.iterdir())
-        except OSError:
-            continue
-        for descriptor in descriptors:
-            try:
-                target = descriptor.readlink().name
-            except OSError:
-                continue
-            if target.startswith("socket:[") and target[8:-1] in inodes:
-                return int(pid_dir.name)
-    raise ReceiptError(
-        f"the socket listening on {host}:{port} is not owned by a visible "
-        "process; run the attestor as the same user as the API server"
-    )
-
-
-def _listening_inodes(host: str, port: int) -> set[str]:
-    """Socket inodes in LISTEN state bound to `port` on a matching address."""
-    wanted = {_hex_address(host, port), _hex_address("0.0.0.0", port)}
-    if ":" not in host:
-        wanted.add(_hex_address("::", port, ipv6=True))
-    inodes: set[str] = set()
-    for name, ipv6 in (("tcp", False), ("tcp6", True)):
-        try:
-            lines = Path(f"/proc/net/{name}").read_text().splitlines()[1:]
-        except OSError:
-            continue
-        for line in lines:
-            fields = line.split()
-            if len(fields) < 10 or fields[3] != "0A":  # 0A == TCP_LISTEN
-                continue
-            local = fields[1].upper()
-            if local in wanted or (
-                ipv6 and local.endswith(f":{port:04X}") and _is_any_address(local)
-            ):
-                inodes.add(fields[9])
-    return inodes
-
-
-def _hex_address(host: str, port: int, *, ipv6: bool = False) -> str:
-    if ipv6:
-        packed = socket.inet_pton(socket.AF_INET6, host)
-        words = [
-            packed[index : index + 4][::-1].hex().upper() for index in (0, 4, 8, 12)
-        ]
-        return f"{''.join(words)}:{port:04X}"
-    packed = socket.inet_pton(socket.AF_INET, host)
-    return f"{packed[::-1].hex().upper()}:{port:04X}"
-
-
-def _is_any_address(local: str) -> bool:
-    return set(local.split(":")[0]) == {"0"}
 
 
 def _wait_for_contribution(policy_dir: Path, timeout_seconds: float) -> None:
@@ -122,9 +59,70 @@ def _wait_for_contribution(policy_dir: Path, timeout_seconds: float) -> None:
         time.sleep(0.1)
 
 
+def _seal(args: argparse.Namespace, policy_dir: Path) -> int:
+    """Ask the live server to seal, then wait for *its* acknowledgement.
+
+    The operator never writes the seal. That is the whole point: a seal
+    produced outside the serving process would certify a stream the server
+    might still be appending to, and would prove nothing about which process
+    produced it.
+    """
+    receipt = read_server_start_receipt(policy_dir / "server_start_receipt.json")
+    expectation = DeploymentExpectation.from_file(args.deployment_manifest)
+    errors = verify_receipt_against_deployment(receipt, expectation)
+    if errors:
+        print(
+            json.dumps({"valid": False, "errors": errors}, indent=2, sort_keys=True),
+            file=sys.stderr,
+        )
+        return _EXIT_INVALID
+
+    write_seal_request(
+        policy_dir,
+        server_instance_id=receipt.server_instance_id,
+        deployment_manifest_sha256=sha256_file(args.deployment_manifest),
+        expected_final_generation=args.expect_final_generation,
+        attestation_nonce=args.nonce,
+    )
+
+    deadline = time.monotonic() + args.wait_seconds
+    while True:
+        ack = read_seal_ack(policy_dir)
+        # An acknowledgement for a different instance is somebody else's
+        # answer, so it is not this request's answer.
+        if ack is not None and ack["server_instance_id"] == receipt.server_instance_id:
+            print(json.dumps(ack, indent=2, sort_keys=True))
+            return _EXIT_OK if ack["status"] == ACK_SEALED else _EXIT_INVALID
+        if time.monotonic() >= deadline:
+            raise ReceiptError(
+                f"the server did not acknowledge the seal request within "
+                f"{args.wait_seconds:g}s; if it is idle it may need one "
+                "discarded request to reach its next scheduling boundary"
+            )
+        time.sleep(0.1)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gladius_vllm.attest")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    seal = subparsers.add_parser(
+        "seal",
+        help=(
+            "ask the live server to certify and retire its policy directory, "
+            "then wait for its instance-bound acknowledgement"
+        ),
+    )
+    seal.add_argument("--policy-dir", type=Path, required=True)
+    seal.add_argument("--nonce", required=True)
+    seal.add_argument("--deployment-manifest", type=Path, required=True)
+    seal.add_argument(
+        "--expect-final-generation",
+        type=int,
+        default=None,
+        help="refuse to seal before the server has reached this generation",
+    )
+    seal.add_argument("--wait-seconds", type=float, default=300.0)
 
     for name in ("publish", "verify"):
         subparser = subparsers.add_parser(name)
@@ -144,25 +142,15 @@ def _build_parser() -> argparse.ArgumentParser:
             )
             subparser.add_argument("--wait-seconds", type=float, default=300.0)
         else:
+            # Required, not optional. There is exactly one verification
+            # path and it consumes the whole expectation: an argument that
+            # can be omitted is a check that can be skipped, and the
+            # reviewed revision reported skipped checks as passes.
             subparser.add_argument(
                 "--deployment-manifest",
                 type=Path,
-                default=None,
-                help=(
-                    "the immutable manifest of expected identity and digests; "
-                    "required by --formal"
-                ),
-            )
-            subparser.add_argument("--expect-gpu-uuid", default=None)
-            subparser.add_argument("--expect-engine-id", default=None)
-            subparser.add_argument("--expect-model-id", default=None)
-            subparser.add_argument(
-                "--formal",
-                action="store_true",
-                help=(
-                    "require the frozen Qwen3-8B startup configuration and every "
-                    "deployment digest; needs --deployment-manifest"
-                ),
+                required=True,
+                help="the immutable manifest of expected identity and digests",
             )
     return parser
 
@@ -172,13 +160,15 @@ def main(argv: list[str] | None = None) -> int:
     policy_dir = Path(args.policy_dir)
 
     try:
+        if args.command == "seal":
+            return _seal(args, policy_dir)
         if args.command == "publish":
             _wait_for_contribution(policy_dir, args.wait_seconds)
             # Always derived from the bound socket, never accepted from the
             # caller. A supplied PID that was used directly (the reviewed
             # behaviour) could bind a live but unrelated process to the
             # endpoint the campaign will actually call.
-            api_pid = _listen_socket_owner_pid(args.host, args.port)
+            api_pid = listen_socket_owner_pid(args.host, args.port)
             if args.expect_api_pid is not None and args.expect_api_pid != api_pid:
                 raise ReceiptError(
                     f"{args.host}:{args.port} is owned by PID {api_pid}, not the "
@@ -208,36 +198,22 @@ def main(argv: list[str] | None = None) -> int:
             return _EXIT_OK
 
         receipt = read_server_start_receipt(policy_dir / "server_start_receipt.json")
-        if args.formal:
-            if args.deployment_manifest is None:
+        expectation = DeploymentExpectation.from_file(args.deployment_manifest)
+        for name, supplied, expected in (
+            ("nonce", args.nonce, expectation.attestation_nonce),
+            ("host", args.host, expectation.listen_host),
+            ("port", args.port, expectation.listen_port),
+        ):
+            if supplied != expected:
                 raise ReceiptError(
-                    "--formal requires --deployment-manifest: formal verification "
-                    "checks every deployment digest, and a missing expectation is "
-                    "a failure rather than a skipped check"
+                    f"--{name} {supplied!r} disagrees with the deployment "
+                    f"manifest's {expected!r}"
                 )
-            expectation = DeploymentExpectation.from_file(args.deployment_manifest)
-            for name, supplied, expected in (
-                ("nonce", args.nonce, expectation.attestation_nonce),
-                ("host", args.host, expectation.listen_host),
-                ("port", args.port, expectation.listen_port),
-            ):
-                if supplied != expected:
-                    raise ReceiptError(
-                        f"--{name} {supplied!r} disagrees with the deployment "
-                        f"manifest's {expected!r}"
-                    )
-            errors = verify_receipt_against_deployment(receipt, expectation)
-        else:
-            errors = verify_server_start_receipt(
-                receipt,
-                expected_nonce=args.nonce,
-                expected_engine_id=args.expect_engine_id,
-                expected_model_id=args.expect_model_id,
-                expected_listen_host=args.host,
-                expected_listen_port=args.port,
-                expected_gpu_uuid=args.expect_gpu_uuid,
-            )
-    except ReceiptError as error:
+        # The same function SMIG and the contract tests call. One
+        # implementation means the two repositories cannot drift into
+        # disagreeing about what a valid receipt is.
+        errors = verify_receipt_against_deployment(receipt, expectation)
+    except (ReceiptError, SealRequestError, SocketOwnerError) as error:
         print(f"attestation failed: {error}", file=sys.stderr)
         return _EXIT_INVALID
     except (OSError, ValueError) as error:

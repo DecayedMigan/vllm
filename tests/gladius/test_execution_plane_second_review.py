@@ -20,11 +20,10 @@ from gladius_vllm.receipt import (
     RECEIPT_FILENAME,
     DeploymentExpectation,
     ReceiptError,
-    _resolve_nvml_handle,
     assemble_server_start_receipt,
     parse_server_start_receipt,
+    resolve_physical_gpu_identity,
     verify_receipt_against_deployment,
-    verify_server_start_receipt,
 )
 from gladius_vllm.telemetry import (
     POLICY_APPLICATION_FILENAME,
@@ -35,6 +34,10 @@ from gladius_vllm.telemetry import (
     parse_telemetry_record_v2,
     parse_telemetry_seal,
     verify_telemetry_seal,
+)
+from tests.gladius.evidence_builders import (
+    deployment_manifest_payload,
+    expectation_matching_receipt_on_disk,
 )
 
 FIXTURE = json.loads(
@@ -54,16 +57,25 @@ def _record(step: int, **overrides) -> dict:
     return record
 
 
-def _write_siblings(policy_dir: Path) -> None:
+def _write_siblings(policy_dir: Path, *, final_step: int | None = None) -> None:
+    """Publish the receipt and the acknowledgement for the sealed instance.
+
+    `final_step` re-points the acknowledgement at a step the telemetry under
+    test actually contains: a live server can only acknowledge a step it has
+    run, and the seal now re-derives that rather than taking it on trust.
+    """
     (policy_dir / SERVER_START_RECEIPT_FILENAME).write_text(json.dumps(RECEIPT))
-    (policy_dir / POLICY_APPLICATION_FILENAME).write_text(json.dumps(APPLICATION))
+    application = dict(APPLICATION)
+    if final_step is not None:
+        application["scheduler_step"] = final_step
+    (policy_dir / POLICY_APPLICATION_FILENAME).write_text(json.dumps(application))
 
 
 def _seal(tmp_path: Path, records: list[dict], *, siblings: bool = True) -> bool:
     path = tmp_path / "telemetry.jsonl"
     path.write_text("".join(json.dumps(r) + "\n" for r in records))
     if siblings:
-        _write_siblings(tmp_path)
+        _write_siblings(tmp_path, final_step=records[-1]["step"] if records else None)
     writer = TelemetryWriter(
         path=path, engine_id=RECEIPT["engine_id"], model_id=RECEIPT["model_id"]
     )
@@ -105,6 +117,12 @@ class _FakeNvml:
             raise RuntimeError(f"unknown uuid {key}")
         return self.by_uuid[key]
 
+    def nvmlDeviceGetUUID(self, handle):  # noqa: N802
+        return handle
+
+    def nvmlDeviceGetName(self, handle):  # noqa: N802
+        return "NVIDIA H100 80GB HBM3"
+
 
 @pytest.mark.parametrize(
     ("bus_id", "expected"),
@@ -119,9 +137,11 @@ def test_the_handle_is_resolved_by_pci_bus_id_not_logical_ordinal(bus_id, expect
     """Every replica sees logical device 0 under one-process-per-GPU."""
     nvml = _FakeNvml()
 
-    handle = _resolve_nvml_handle(nvml, pci_bus_id=bus_id, cuda_uuid=None)
+    identity = resolve_physical_gpu_identity(
+        nvml=nvml, pci_bus_id=bus_id, cuda_uuid=expected
+    )
 
-    assert handle == expected
+    assert identity.physical_gpu_uuid == expected
     # The reviewed code would have returned physical GPU 0 for all four.
     assert nvml.nvmlDeviceGetHandleByIndex(0) == (
         "GPU-aaaa0000-0000-0000-0000-000000000000"
@@ -129,16 +149,23 @@ def test_the_handle_is_resolved_by_pci_bus_id_not_logical_ordinal(bus_id, expect
 
 
 def test_a_uuid_form_mask_still_resolves_the_right_device():
+    """CUDA reports the UUID bare or `GPU-`-prefixed depending on version."""
     nvml = _FakeNvml()
+    bus_id = "00000000:0C:00.0"
 
-    bare = _resolve_nvml_handle(
-        nvml, pci_bus_id=None, cuda_uuid="cccc2222-2222-2222-2222-222222222222"
+    bare = resolve_physical_gpu_identity(
+        nvml=nvml,
+        pci_bus_id=bus_id,
+        cuda_uuid="cccc2222-2222-2222-2222-222222222222",
     )
-    prefixed = _resolve_nvml_handle(
-        nvml, pci_bus_id=None, cuda_uuid="GPU-cccc2222-2222-2222-2222-222222222222"
+    prefixed = resolve_physical_gpu_identity(
+        nvml=nvml,
+        pci_bus_id=bus_id,
+        cuda_uuid="GPU-cccc2222-2222-2222-2222-222222222222",
     )
 
-    assert bare == prefixed == "GPU-cccc2222-2222-2222-2222-222222222222"
+    assert bare.physical_gpu_uuid == prefixed.physical_gpu_uuid
+    assert bare.physical_gpu_uuid == "GPU-cccc2222-2222-2222-2222-222222222222"
 
 
 def test_a_reordered_mask_does_not_shift_the_resolved_device():
@@ -146,33 +173,55 @@ def test_a_reordered_mask_does_not_shift_the_resolved_device():
     nvml = _FakeNvml()
 
     # Logical 0 under the mask "3,1" is physical GPU 3.
-    handle = _resolve_nvml_handle(nvml, pci_bus_id="00000000:0D:00.0", cuda_uuid=None)
+    identity = resolve_physical_gpu_identity(
+        nvml=nvml,
+        pci_bus_id="00000000:0D:00.0",
+        cuda_uuid="GPU-dddd3333-3333-3333-3333-333333333333",
+    )
 
-    assert handle == "GPU-dddd3333-3333-3333-3333-333333333333"
+    assert identity.physical_gpu_uuid == "GPU-dddd3333-3333-3333-3333-333333333333"
 
 
 def test_an_unresolvable_device_fails_rather_than_guessing():
     nvml = _FakeNvml()
 
-    with pytest.raises(DigestError, match="neither a PCI bus id nor a CUDA device"):
-        _resolve_nvml_handle(nvml, pci_bus_id=None, cuda_uuid=None)
+    with pytest.raises(DigestError, match="GPU_IDENTITY_AMBIGUOUS"):
+        resolve_physical_gpu_identity(nvml=nvml, pci_bus_id=None, cuda_uuid=None)
 
-    with pytest.raises(DigestError, match="cannot map the bound CUDA device"):
-        _resolve_nvml_handle(
-            nvml, pci_bus_id="00000000:FF:00.0", cuda_uuid="GPU-not-present"
+    with pytest.raises(DigestError, match="GPU_IDENTITY_AMBIGUOUS"):
+        resolve_physical_gpu_identity(
+            nvml=nvml, pci_bus_id="00000000:FF:00.0", cuda_uuid="GPU-not-present"
         )
 
 
-def test_a_stale_pci_id_falls_through_to_the_uuid(caplog):
+def test_a_stale_pci_id_no_longer_falls_through_to_the_uuid():
+    """The second review's fall-through is itself now a refusal.
+
+    Resolving by whichever identity happens to work is a single unverified
+    lookup: if it silently returns the wrong handle there is nothing to
+    disagree with it. The third review requires both namespaces to name the
+    same device, so an unresolvable PCI id is ambiguity, not a fallback.
+    """
     nvml = _FakeNvml()
 
-    handle = _resolve_nvml_handle(
-        nvml,
-        pci_bus_id="00000000:FF:00.0",
-        cuda_uuid="GPU-bbbb1111-1111-1111-1111-111111111111",
-    )
+    with pytest.raises(DigestError, match="GPU_IDENTITY_AMBIGUOUS"):
+        resolve_physical_gpu_identity(
+            nvml=nvml,
+            pci_bus_id="00000000:FF:00.0",
+            cuda_uuid="GPU-bbbb1111-1111-1111-1111-111111111111",
+        )
 
-    assert handle == "GPU-bbbb1111-1111-1111-1111-111111111111"
+
+def test_two_namespaces_naming_different_devices_is_a_refusal():
+    """The check the fall-through made impossible."""
+    nvml = _FakeNvml()
+
+    with pytest.raises(DigestError, match="GPU_IDENTITY_DISAGREEMENT"):
+        resolve_physical_gpu_identity(
+            nvml=nvml,
+            pci_bus_id="00000000:0A:00.0",
+            cuda_uuid="GPU-dddd3333-3333-3333-3333-333333333333",
+        )
 
 
 # --- P0-B: no unverified API-PID override --------------------------------
@@ -253,33 +302,49 @@ def test_assembly_rejects_a_dead_engine_core(tmp_path):
 
 
 def _deployment(**overrides) -> dict:
-    payload = {
-        "schema_version": "2.0.0",
-        "attestation_nonce": RECEIPT["attestation_nonce"],
-        "engine_id": RECEIPT["engine_id"],
-        "model_id": RECEIPT["model_id"],
-        "listen_host": RECEIPT["listen_host"],
-        "listen_port": RECEIPT["listen_port"],
-        "physical_gpu_uuid": RECEIPT["physical_gpu_uuid"],
-        "model_tree_sha256": RECEIPT["model_tree_sha256"],
-        "tokenizer_tree_sha256": RECEIPT["tokenizer_tree_sha256"],
-        "vllm_package_tree_sha256": RECEIPT["vllm_package_tree_sha256"],
-        "vllm_native_binary_sha256": RECEIPT["vllm_native_binary_sha256"],
-        "gladius_overlay_tree_sha256": RECEIPT["gladius_overlay_tree_sha256"],
-        "tree_hash_algorithm_version": RECEIPT["tree_hash_algorithm_version"],
-    }
+    payload = deployment_manifest_payload(
+        **{
+            field: RECEIPT[field]
+            for field in (
+                "attestation_nonce",
+                "engine_id",
+                "model_id",
+                "model_path",
+                "listen_host",
+                "listen_port",
+                "physical_gpu_uuid",
+                "physical_gpu_identity_source",
+                "mig_uuid",
+                "mig_profile",
+                "mig_parent_gpu_uuid",
+                "model_tree_sha256",
+                "tokenizer_tree_sha256",
+                "vllm_package_tree_sha256",
+                "vllm_native_binary_sha256",
+                "gladius_overlay_tree_sha256",
+                "tree_hash_algorithm_version",
+                "vllm_version",
+                "vllm_module_path",
+                "gladius_overlay_path",
+                "cuda_graph_mode",
+            )
+        }
+    )
     payload.update(overrides)
     return payload
 
 
-def test_formal_verification_without_expectations_is_a_failure():
-    receipt = parse_server_start_receipt(RECEIPT)
+def test_no_verification_path_survives_without_expectations():
+    """The second review left a permissive overload; the third removed it.
 
-    # The reviewed behaviour: no expectations supplied, every digest check
-    # silently skipped, and only the startup values compared.
-    errors = verify_server_start_receipt(receipt, require_formal_startup=True)
+    Then, `verify_server_start_receipt(receipt, require_formal_startup=True)`
+    reported "a skipped check is not a pass" -- an error message where an
+    absent code path was needed. A function that *can* be called with no
+    expectations is one a caller can call with no expectations.
+    """
+    import gladius_vllm.receipt as receipt_module
 
-    assert any("skipped check is not a pass" in error for error in errors)
+    assert not hasattr(receipt_module, "verify_server_start_receipt")
 
 
 def test_the_deployment_manifest_drives_every_check():
@@ -332,27 +397,53 @@ def test_the_deployment_manifest_parser_is_strict():
         DeploymentExpectation.from_dict(incomplete)
 
 
-def test_formal_attest_verify_requires_a_deployment_manifest(tmp_path):
+def test_attest_verify_cannot_be_invoked_without_a_deployment_manifest(tmp_path):
+    """The second review made this a runtime error; the third makes it unspoken.
+
+    Previously `--formal` without `--deployment-manifest` parsed fine and
+    failed later, and *without* `--formal` it verified a partial expectation
+    and reported success. There is now one verification path, its manifest is
+    a required argument, and argparse refuses the command outright.
+    """
     from gladius_vllm.attest import main
 
     (tmp_path / RECEIPT_FILENAME).write_text(json.dumps(RECEIPT))
 
-    exit_code = main(
-        [
-            "verify",
-            "--policy-dir",
-            str(tmp_path),
-            "--nonce",
-            RECEIPT["attestation_nonce"],
-            "--host",
-            RECEIPT["listen_host"],
-            "--port",
-            str(RECEIPT["listen_port"]),
-            "--formal",
-        ]
-    )
+    with pytest.raises(SystemExit) as caught:
+        main(
+            [
+                "verify",
+                "--policy-dir",
+                str(tmp_path),
+                "--nonce",
+                RECEIPT["attestation_nonce"],
+                "--host",
+                RECEIPT["listen_host"],
+                "--port",
+                str(RECEIPT["listen_port"]),
+            ]
+        )
 
-    assert exit_code == 1
+    assert caught.value.code == 2  # argparse usage error
+
+    # And there is no `--formal` toggle left to make verification optional.
+    from gladius_vllm.attest import _build_parser
+
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(
+            [
+                "verify",
+                "--policy-dir",
+                str(tmp_path),
+                "--nonce",
+                "n",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8000",
+                "--formal",
+            ]
+        )
 
 
 # --- P0-D: unattested or sibling-less seals ------------------------------
@@ -420,7 +511,11 @@ def test_every_seal_manifest_field_is_re_derived(tmp_path, field, value):
     manifest[field] = value
     manifest_path.write_text(json.dumps(manifest))
 
-    errors = verify_telemetry_seal(manifest_path, tmp_path)
+    errors = verify_telemetry_seal(
+        manifest_path,
+        tmp_path,
+        expectation=expectation_matching_receipt_on_disk(tmp_path),
+    )
 
     assert errors, f"mutating {field} was not detected"
 
@@ -438,7 +533,11 @@ def test_a_replaced_sibling_with_an_updated_digest_is_still_rejected(tmp_path):
     manifest["policy_application_sha256"] = hashlib.sha256(foreign.encode()).hexdigest()
     manifest_path.write_text(json.dumps(manifest))
 
-    errors = verify_telemetry_seal(manifest_path, tmp_path)
+    errors = verify_telemetry_seal(
+        manifest_path,
+        tmp_path,
+        expectation=expectation_matching_receipt_on_disk(tmp_path),
+    )
 
     assert any("different server instance" in error for error in errors), errors
 
@@ -593,7 +692,14 @@ def test_a_second_writer_cannot_reopen_a_sealed_directory(tmp_path):
         )
 
     assert (tmp_path / "telemetry.jsonl").read_bytes() == certified
-    assert verify_telemetry_seal(tmp_path / "telemetry_seal.json", tmp_path) == []
+    assert (
+        verify_telemetry_seal(
+            tmp_path / "telemetry_seal.json",
+            tmp_path,
+            expectation=expectation_matching_receipt_on_disk(tmp_path),
+        )
+        == []
+    )
 
 
 def test_a_retired_directory_refuses_a_writer_even_without_a_seal(tmp_path):

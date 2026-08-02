@@ -18,6 +18,20 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from gladius_vllm.atomic import atomic_write_json
+from gladius_vllm.evidence_codes import (
+    SEAL_APPLICATION_SEMANTIC_MISMATCH,
+    SEAL_APPLICATION_STEP_UNSEALED,
+    SEAL_BOUNDS_MISMATCH,
+    SEAL_INSTANCE_MISMATCH,
+    SEAL_RECEIPT_EXPECTATION_MISMATCH,
+    SEAL_SCHEMA_INVALID,
+    SEAL_SEGMENT_CONTENT_MISMATCH,
+    SEAL_SEGMENT_SET_MISMATCH,
+    TELEMETRY_DIRECTORY_RETIRED,
+    TELEMETRY_SCHEMA_INVALID,
+    classify,
+)
+from gladius_vllm.evidence_lock import evidence_lock
 from gladius_vllm.policy import PolicyDecision
 from gladius_vllm.schema import (
     DEFAULT_TELEMETRY_MAX_BYTES,
@@ -49,9 +63,25 @@ def _is_retired(policy_dir: Path) -> bool:
 
 
 def retire_policy_directory(policy_dir: Path) -> None:
-    """Mark a policy directory closed to any further telemetry writer."""
+    """Mark a policy directory closed to any further telemetry writer.
+
+    Taken under the exclusive evidence lock so it cannot interleave with an
+    append already in flight: after this returns, every writer -- including
+    one opened long before -- observes the directory as retired.
+    """
     policy_dir = Path(policy_dir)
     policy_dir.mkdir(parents=True, exist_ok=True)
+    with evidence_lock(policy_dir, exclusive=True):
+        _write_retirement_marker(policy_dir)
+
+
+def _write_retirement_marker(policy_dir: Path) -> None:
+    """Retirement without acquiring the lock.
+
+    `flock` is per-open-file-description, so a caller that already holds the
+    exclusive lock would block forever waiting on itself. The seal path is
+    exactly such a caller.
+    """
     atomic_write_json(
         policy_dir / RETIRED_MARKER_FILENAME,
         {
@@ -385,68 +415,137 @@ def parse_telemetry_seal(payload: object) -> dict[str, Any]:
     return payload
 
 
-def verify_telemetry_seal(manifest_path: Path, policy_dir: Path) -> list[str]:
-    """Re-derive *everything* a seal claims, from the files still on disk.
+def telemetry_segment_names(policy_dir: Path, *, live_name: str) -> set[str]:
+    """Every telemetry segment actually present in `policy_dir`.
 
-    A seal that is only ever written is not evidence. This recomputes the
-    instance identity, generation high-watermark, step bounds, record count,
-    monotonic step sequence, engine/model identity, and both sibling digests
-    -- and re-parses the siblings to confirm they describe the same instance.
-    A field the verifier does not re-derive is a field an attacker can edit
-    freely, which is exactly how the reviewed revision let a watermark of
-    `999` pass.
+    The verifier must enumerate the directory rather than walk the manifest.
+    A manifest-only walk cannot see a segment the manifest does not list, so
+    an attacker could drop an inconvenient segment from certification while
+    leaving it on disk and the seal would still verify.
+    """
+    policy_dir = Path(policy_dir)
+    names = {candidate.name for candidate in policy_dir.glob(f"{live_name}.*-*")}
+    if (policy_dir / live_name).is_file():
+        names.add(live_name)
+    return names
+
+
+def verify_telemetry_seal(
+    manifest_path: Path,
+    policy_dir: Path,
+    *,
+    expectation: Any,
+    live_name: str = "telemetry.jsonl",
+) -> list[str]:
+    """Re-derive everything a seal claims, semantically, from disk.
+
+    Two properties the reviewed verifier lacked and which this exists to
+    provide:
+
+    * the certified file *set* is compared against the segments actually
+      present, not merely against the manifest's own list;
+    * both siblings are checked for agreement with the deployment
+      expectation and with the sealed telemetry stream, so a coherent
+      rewrite -- edit a field, rebuild its digest, rebuild the manifest --
+      still fails. A checksum match proves the bytes were copied intact and
+      nothing more.
+
+    `expectation` is required. There is no variant of this function that
+    verifies a seal without one.
 
     Returns every discrepancy rather than raising on the first, so one pass
     gives the complete diagnosis.
     """
     manifest_path = Path(manifest_path)
     policy_dir = Path(policy_dir)
+    if expectation is None:
+        return [
+            classify(
+                SEAL_RECEIPT_EXPECTATION_MISMATCH,
+                "a formal seal cannot be verified without a deployment "
+                "expectation; a skipped check is not a pass",
+            )
+        ]
     try:
         manifest = parse_telemetry_seal(json.loads(manifest_path.read_text()))
     except (OSError, json.JSONDecodeError, TelemetrySealError) as error:
-        return [f"telemetry seal unusable: {error}"]
+        return [classify(SEAL_SCHEMA_INVALID, f"telemetry seal unusable: {error}")]
 
     errors: list[str] = []
-    seen_names: set[str] = set()
+    listed = [entry["name"] for entry in manifest["files"]]
+    if len(set(listed)) != len(listed):
+        duplicates = sorted({name for name in listed if listed.count(name) > 1})
+        errors.append(
+            classify(
+                SEAL_SEGMENT_SET_MISMATCH,
+                f"telemetry seal lists {duplicates} more than once",
+            )
+        )
+    present = telemetry_segment_names(policy_dir, live_name=live_name)
+    if set(listed) != present:
+        unlisted = sorted(present - set(listed))
+        absent = sorted(set(listed) - present)
+        errors.append(
+            classify(
+                SEAL_SEGMENT_SET_MISMATCH,
+                f"certified segment set does not match the directory: "
+                f"present-but-unlisted={unlisted}, listed-but-missing={absent}",
+            )
+        )
+
     observed_records = 0
     observed_first: int | None = None
     observed_last: int | None = None
     observed_watermark: int | None = None
     instances: set[str | None] = set()
     identities: set[tuple[str, str]] = set()
+    records_by_step: dict[int, dict[str, Any]] = {}
 
     for entry in manifest["files"]:
         name = entry["name"]
-        if name in seen_names:
-            errors.append(f"telemetry seal lists {name} twice")
-            continue
-        seen_names.add(name)
         path = policy_dir / name
         if not path.is_file():
-            errors.append(f"certified segment {name} is missing")
             continue
         payload = path.read_bytes()
         if hashlib.sha256(payload).hexdigest() != entry["sha256"]:
-            errors.append(f"certified segment {name} changed after sealing")
+            errors.append(
+                classify(
+                    SEAL_SEGMENT_CONTENT_MISMATCH,
+                    f"certified segment {name} changed after sealing",
+                )
+            )
             continue
         if len(payload) != entry["size"]:
-            errors.append(f"certified segment {name} has an unexpected size")
+            errors.append(
+                classify(
+                    SEAL_SEGMENT_CONTENT_MISMATCH,
+                    f"certified segment {name} has an unexpected size",
+                )
+            )
         for line_number, line in enumerate(payload.decode().splitlines(), start=1):
             if not line.strip():
                 continue
             try:
                 record = parse_telemetry_record_v2(json.loads(line))
             except (json.JSONDecodeError, TelemetrySealError) as error:
-                errors.append(f"{name} line {line_number}: {error}")
+                errors.append(
+                    classify(
+                        TELEMETRY_SCHEMA_INVALID, f"{name} line {line_number}: {error}"
+                    )
+                )
                 continue
             step = record["step"]
             if observed_last is not None and step <= observed_last:
                 errors.append(
-                    f"{name} line {line_number}: step {step} does not increase"
+                    classify(
+                        SEAL_BOUNDS_MISMATCH,
+                        f"{name} line {line_number}: step {step} does not increase",
+                    )
                 )
             observed_first = step if observed_first is None else observed_first
             observed_last = step
             observed_records += 1
+            records_by_step[step] = record
             instances.add(record["server_instance_id"])
             identities.add((record["engine_id"], record["model_id"]))
             candidate = record["generation_high_watermark"]
@@ -462,26 +561,53 @@ def verify_telemetry_seal(manifest_path: Path, policy_dir: Path) -> list[str]:
     # made an entirely unattested stream derive a null instance and pass.
     if None in instances:
         errors.append(
-            "certified telemetry contains unattested records (server_instance_id "
-            "is null); a formal seal requires every record to name its instance"
+            classify(
+                SEAL_INSTANCE_MISMATCH,
+                "certified telemetry contains unattested records "
+                "(server_instance_id is null); a formal seal requires every "
+                "record to name its instance",
+            )
         )
     attested = {value for value in instances if value is not None}
     if len(attested) > 1:
-        errors.append("certified telemetry mixes multiple server instances")
+        errors.append(
+            classify(
+                SEAL_INSTANCE_MISMATCH,
+                "certified telemetry mixes multiple server instances",
+            )
+        )
     elif attested and manifest["server_instance_id"] not in attested:
-        errors.append("telemetry seal names a different server instance")
+        errors.append(
+            classify(
+                SEAL_INSTANCE_MISMATCH,
+                "telemetry seal names a different server instance",
+            )
+        )
     if len(identities) > 1:
-        errors.append("certified telemetry mixes multiple engine/model identities")
+        errors.append(
+            classify(
+                SEAL_INSTANCE_MISMATCH,
+                "certified telemetry mixes multiple engine/model identities",
+            )
+        )
     elif identities and next(iter(identities)) != (
         manifest["engine_id"],
         manifest["model_id"],
     ):
-        errors.append("telemetry seal names a different engine/model identity")
+        errors.append(
+            classify(
+                SEAL_INSTANCE_MISMATCH,
+                "telemetry seal names a different engine/model identity",
+            )
+        )
 
     if manifest["record_count"] != observed_records:
         errors.append(
-            f"telemetry seal claims {manifest['record_count']} records, "
-            f"found {observed_records}"
+            classify(
+                SEAL_BOUNDS_MISMATCH,
+                f"telemetry seal claims {manifest['record_count']} records, "
+                f"found {observed_records}",
+            )
         )
     for field, observed in (
         ("first_scheduler_step", observed_first),
@@ -490,53 +616,194 @@ def verify_telemetry_seal(manifest_path: Path, policy_dir: Path) -> list[str]:
     ):
         if manifest[field] != observed:
             errors.append(
-                f"telemetry seal {field} is {manifest[field]}, found {observed}"
+                classify(
+                    SEAL_BOUNDS_MISMATCH,
+                    f"telemetry seal {field} is {manifest[field]}, found {observed}",
+                )
             )
 
-    errors.extend(_verify_sealed_siblings(manifest, policy_dir))
+    errors.extend(
+        _verify_sealed_siblings(
+            manifest,
+            policy_dir,
+            expectation=expectation,
+            records_by_step=records_by_step,
+            observed_watermark=observed_watermark,
+        )
+    )
     return errors
 
 
-def _verify_sealed_siblings(manifest: dict[str, Any], policy_dir: Path) -> list[str]:
-    """Re-hash *and re-parse* the receipt and acknowledgement.
+def _verify_sealed_siblings(
+    manifest: dict[str, Any],
+    policy_dir: Path,
+    *,
+    expectation: Any,
+    records_by_step: dict[int, dict[str, Any]],
+    observed_watermark: int | None,
+) -> list[str]:
+    """Check both siblings against the expectation and the sealed stream.
 
-    Comparing digests alone would accept a sibling whose content was replaced
-    wholesale as long as the manifest digest was updated to match. Parsing
-    them and checking they name the sealed instance closes that.
+    The digest comparison here is transport integrity only. Everything that
+    decides whether the evidence is *true* is re-derived: the receipt against
+    the immutable deployment manifest, and the acknowledgement against the
+    telemetry record at the very step it claims.
     """
     from gladius_vllm.application import parse_policy_application_v2
-    from gladius_vllm.receipt import parse_server_start_receipt
+    from gladius_vllm.receipt import (
+        parse_server_start_receipt,
+        verify_receipt_against_deployment,
+    )
 
     errors: list[str] = []
-    for field, filename, parser, instance_of in (
-        (
-            "attestation_receipt_sha256",
-            SERVER_START_RECEIPT_FILENAME,
-            parse_server_start_receipt,
-            lambda value: value.server_instance_id,
-        ),
-        (
-            "policy_application_sha256",
-            POLICY_APPLICATION_FILENAME,
-            parse_policy_application_v2,
-            lambda value: value.server_instance_id,
-        ),
-    ):
-        path = policy_dir / filename
-        if not path.is_file():
-            errors.append(f"{filename} is missing; a formal seal requires it")
-            continue
-        payload = path.read_bytes()
-        if hashlib.sha256(payload).hexdigest() != manifest[field]:
-            errors.append(f"{filename} changed after sealing")
-            continue
+
+    receipt_path = policy_dir / SERVER_START_RECEIPT_FILENAME
+    if not receipt_path.is_file():
+        errors.append(
+            classify(
+                SEAL_RECEIPT_EXPECTATION_MISMATCH,
+                f"{SERVER_START_RECEIPT_FILENAME} is missing; a formal seal "
+                "requires it",
+            )
+        )
+    else:
+        payload = receipt_path.read_bytes()
+        expected = manifest["attestation_receipt_sha256"]
+        if hashlib.sha256(payload).hexdigest() != expected:
+            errors.append(
+                classify(
+                    SEAL_SEGMENT_CONTENT_MISMATCH,
+                    f"{SERVER_START_RECEIPT_FILENAME} changed after sealing",
+                )
+            )
         try:
-            parsed = parser(json.loads(payload))
+            receipt = parse_server_start_receipt(json.loads(payload))
         except (json.JSONDecodeError, ValueError) as error:
-            errors.append(f"{filename} does not parse strictly: {error}")
-            continue
-        if instance_of(parsed) != manifest["server_instance_id"]:
-            errors.append(f"{filename} names a different server instance")
+            errors.append(
+                classify(
+                    SEAL_RECEIPT_EXPECTATION_MISMATCH,
+                    f"{SERVER_START_RECEIPT_FILENAME} does not parse strictly: {error}",
+                )
+            )
+        else:
+            if receipt.server_instance_id != manifest["server_instance_id"]:
+                errors.append(
+                    classify(
+                        SEAL_INSTANCE_MISMATCH,
+                        f"{SERVER_START_RECEIPT_FILENAME} names a different "
+                        "server instance",
+                    )
+                )
+            # The check a rehash cannot survive: the receipt's own content
+            # must still describe the deployment the campaign froze.
+            # Archival: a seal is verified after the server has exited, so
+            # process liveness and socket ownership are not properties of a
+            # valid seal. Everything about the receipt's *content* is still
+            # compared against the expectation.
+            for problem in verify_receipt_against_deployment(
+                receipt,
+                expectation,
+                recheck_socket_owner=False,
+                recheck_live_processes=False,
+            ):
+                errors.append(classify(SEAL_RECEIPT_EXPECTATION_MISMATCH, problem))
+
+    application_path = policy_dir / POLICY_APPLICATION_FILENAME
+    if not application_path.is_file():
+        errors.append(
+            classify(
+                SEAL_APPLICATION_SEMANTIC_MISMATCH,
+                f"{POLICY_APPLICATION_FILENAME} is missing; a formal seal requires it",
+            )
+        )
+        return errors
+
+    payload = application_path.read_bytes()
+    if hashlib.sha256(payload).hexdigest() != manifest["policy_application_sha256"]:
+        errors.append(
+            classify(
+                SEAL_SEGMENT_CONTENT_MISMATCH,
+                f"{POLICY_APPLICATION_FILENAME} changed after sealing",
+            )
+        )
+    try:
+        application = parse_policy_application_v2(json.loads(payload))
+    except (json.JSONDecodeError, ValueError) as error:
+        errors.append(
+            classify(
+                SEAL_APPLICATION_SEMANTIC_MISMATCH,
+                f"{POLICY_APPLICATION_FILENAME} does not parse strictly: {error}",
+            )
+        )
+        return errors
+
+    if application.server_instance_id != manifest["server_instance_id"]:
+        errors.append(
+            classify(
+                SEAL_INSTANCE_MISMATCH,
+                f"{POLICY_APPLICATION_FILENAME} names a different server instance",
+            )
+        )
+    for label, actual, expected in (
+        ("engine_id", application.engine_id, manifest["engine_id"]),
+        ("model_id", application.model_id, manifest["model_id"]),
+    ):
+        if actual != expected:
+            errors.append(
+                classify(
+                    SEAL_APPLICATION_SEMANTIC_MISMATCH,
+                    f"acknowledged {label} {actual!r} is not the sealed {expected!r}",
+                )
+            )
+    if application.generation_high_watermark != observed_watermark:
+        errors.append(
+            classify(
+                SEAL_APPLICATION_SEMANTIC_MISMATCH,
+                "acknowledged generation_high_watermark "
+                f"{application.generation_high_watermark} is not the "
+                f"{observed_watermark} the sealed telemetry proves",
+            )
+        )
+
+    record = records_by_step.get(application.scheduler_step)
+    if record is None:
+        errors.append(
+            classify(
+                SEAL_APPLICATION_STEP_UNSEALED,
+                f"acknowledgement names scheduler step "
+                f"{application.scheduler_step}, which the sealed telemetry "
+                "does not contain",
+            )
+        )
+        return errors
+
+    # The record at that exact step has to agree about what was applied.
+    # This is what a coherently rehashed action rewrite cannot satisfy.
+    application_payload = json.loads(payload)
+    for field in ("requested_admission", "effective_admission", "clamped"):
+        if application_payload[field] != record[field]:
+            errors.append(
+                classify(
+                    SEAL_APPLICATION_SEMANTIC_MISMATCH,
+                    f"acknowledged {field} {application_payload[field]!r} "
+                    f"disagrees with the telemetry record at step "
+                    f"{application.scheduler_step}: {record[field]!r}",
+                )
+            )
+    for label, actual, expected in (
+        ("generation", application.generation, record["generation"]),
+        ("policy_id", application.policy_id, record["policy_id"]),
+        ("decision_id", application.decision_id, record["decision_id"]),
+    ):
+        if actual != expected:
+            errors.append(
+                classify(
+                    SEAL_APPLICATION_SEMANTIC_MISMATCH,
+                    f"acknowledged {label} {actual!r} disagrees with the "
+                    f"telemetry record at step {application.scheduler_step}: "
+                    f"{expected!r}",
+                )
+            )
     return errors
 
 
@@ -743,8 +1010,9 @@ class TelemetryWriter:
                 "telemetry_write_ns": self._last_write_ns,
             }
             write_started = time.perf_counter_ns()
-            self._file.write(json.dumps(record) + "\n")
-            self._file.flush()
+            # One append path, so the retirement recheck cannot be bypassed
+            # by the scheduler's hot loop.
+            self.append_record(record)
             self._last_write_ns = time.perf_counter_ns() - write_started
         except Exception:
             logger.warning(
@@ -755,6 +1023,39 @@ class TelemetryWriter:
             with contextlib.suppress(OSError):
                 self._file.close()
             self._file = None
+
+    def append_record(self, record: dict[str, Any]) -> None:
+        """Append one already-built record, refusing a retired directory.
+
+        Public and fail-*closed*, unlike `record()`. The retirement check
+        happens while holding the directory's shared evidence lock and is
+        repeated on every append, so a writer opened before a seal cannot
+        extend certified evidence afterwards -- the defect the third review
+        found in the constructor-only check.
+        """
+        if self._path is None or self._file is None:
+            raise TelemetrySealError(
+                classify(
+                    TELEMETRY_DIRECTORY_RETIRED,
+                    "this telemetry writer holds no open stream",
+                )
+            )
+        parse_telemetry_record_v2(record)
+        with evidence_lock(self._path.parent, exclusive=False):
+            if _is_retired(self._path.parent):
+                with contextlib.suppress(OSError):
+                    self._file.close()
+                self._file = None
+                self._sealed = True
+                raise TelemetrySealError(
+                    classify(
+                        TELEMETRY_DIRECTORY_RETIRED,
+                        f"{self._path.parent} was retired; its certified "
+                        "evidence may not be extended",
+                    )
+                )
+            self._file.write(json.dumps(record) + "\n")
+            self._file.flush()
 
     def close(self) -> None:
         if self._file is not None:
@@ -892,16 +1193,20 @@ class TelemetryWriter:
     def seal(self, manifest_path: Path) -> bool:
         """Close and atomically certify this writer's telemetry segments.
 
-        The writer is closed *before* anything is hashed, so no record can be
-        appended between the digest and the manifest. After this returns the
-        stream is permanently frozen: `record()` keeps counting steps (so the
-        scheduler's step identity stays continuous) but never writes again,
-        and scheduling itself is unaffected.
+        Taken under the directory's *exclusive* evidence lock, so no other
+        writer -- in this process or another -- can be mid-append while the
+        segments are hashed. The writer is closed before anything is hashed,
+        and retirement is written before the lock is released, so the whole
+        transition is atomic with respect to every appender.
         """
         self._sealed = True
         self.close()
         if self._path is None:
             return False
+        with evidence_lock(self._path.parent, exclusive=True):
+            return self._seal_locked(manifest_path)
+
+    def _seal_locked(self, manifest_path: Path) -> bool:
         if self._half_native_seen:
             logger.warning(
                 "GLADIUS refusing to seal %s: this instance emitted a "
@@ -940,8 +1245,10 @@ class TelemetryWriter:
             parse_telemetry_seal(manifest)
             atomic_write_json(manifest_path, manifest)
             # The directory now holds certified evidence: no later writer may
-            # reopen it, even one in a freshly started server process.
-            retire_policy_directory(self._path.parent)
+            # reopen it, even one in a freshly started server process. Written
+            # before the exclusive lock is released, so no appender can
+            # observe the seal without also observing the retirement.
+            _write_retirement_marker(self._path.parent)
             return True
         except Exception:
             logger.warning(

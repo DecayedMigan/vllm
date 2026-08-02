@@ -76,6 +76,10 @@ def receipt_payload(**overrides: Any) -> dict[str, Any]:
         "cuda_visible_devices": "0",
         "physical_gpu_uuid": GPU_UUID,
         "physical_gpu_name": "NVIDIA H100 80GB HBM3",
+        "physical_gpu_identity_source": "cuda-nvml-corroborated",
+        "mig_uuid": None,
+        "mig_profile": None,
+        "mig_parent_gpu_uuid": None,
         "model_path": MODEL_ID,
         "model_tree_sha256": sha("model"),
         "tokenizer_tree_sha256": sha("tokenizer"),
@@ -198,8 +202,18 @@ def application_payload(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
+ROTATED_SEGMENT_NAME = "telemetry.jsonl.1754130000-1"
+
+
+def _segment_paths(policy_dir: Path) -> list[Path]:
+    """Every telemetry segment on disk, in the writer's rotation order."""
+    rotated = sorted(policy_dir.glob("telemetry.jsonl.*-*"))
+    live = policy_dir / "telemetry.jsonl"
+    return rotated + ([live] if live.is_file() else [])
+
+
 def seal_payload(policy_dir: Path, *, steps: tuple[int, ...], **overrides: Any) -> dict:
-    telemetry = policy_dir / "telemetry.jsonl"
+    segments = _segment_paths(policy_dir)
     payload: dict[str, Any] = {
         "schema_version": EXECUTION_EVIDENCE_SCHEMA_VERSION,
         "engine_id": ENGINE_ID,
@@ -216,10 +230,11 @@ def seal_payload(policy_dir: Path, *, steps: tuple[int, ...], **overrides: Any) 
         "generation_high_watermark": 7,
         "files": [
             {
-                "name": telemetry.name,
-                "size": telemetry.stat().st_size,
-                "sha256": digest_of(telemetry),
+                "name": path.name,
+                "size": path.stat().st_size,
+                "sha256": digest_of(path),
             }
+            for path in segments
         ],
     }
     payload.update(overrides)
@@ -227,10 +242,23 @@ def seal_payload(policy_dir: Path, *, steps: tuple[int, ...], **overrides: Any) 
 
 
 def build_sealed_policy_dir(
-    policy_dir: Path, *, steps: tuple[int, ...] = (1, 2, 3)
+    policy_dir: Path,
+    *,
+    steps: tuple[int, ...] = (1, 2, 3),
+    rotated_steps: tuple[int, ...] = (),
 ) -> Path:
-    """A coherent, fully valid sealed evidence directory."""
+    """A coherent, fully valid sealed evidence directory.
+
+    `rotated_steps` puts earlier records in a rotated segment, so a test can
+    omit *one* of several certified files -- an attack an empty file list
+    cannot express, since a seal with no segments fails schema validation
+    before the set comparison is ever reached.
+    """
     policy_dir.mkdir(parents=True, exist_ok=True)
+    if rotated_steps:
+        (policy_dir / ROTATED_SEGMENT_NAME).write_text(
+            "".join(json.dumps(telemetry_record(step)) + "\n" for step in rotated_steps)
+        )
     (policy_dir / "telemetry.jsonl").write_text(
         "".join(json.dumps(telemetry_record(step)) + "\n" for step in steps)
     )
@@ -239,7 +267,7 @@ def build_sealed_policy_dir(
         json.dumps(application_payload(scheduler_step=steps[-1]))
     )
     (policy_dir / "telemetry_seal.json").write_text(
-        json.dumps(seal_payload(policy_dir, steps=steps))
+        json.dumps(seal_payload(policy_dir, steps=rotated_steps + steps))
     )
     return policy_dir
 
@@ -253,3 +281,30 @@ def reseal_after_mutation(policy_dir: Path, *, steps: tuple[int, ...]) -> None:
     (policy_dir / "telemetry_seal.json").write_text(
         json.dumps(seal_payload(policy_dir, steps=steps))
     )
+
+
+def expectation_matching_receipt_on_disk(policy_dir: Path) -> Any:
+    """A deployment expectation derived from the receipt already written.
+
+    Deliberately vacuous with respect to the receipt: it is built *from* the
+    receipt, so it cannot catch a receipt rewrite. It exists so tests whose
+    subject is some other seal property -- segment ordering, retirement,
+    post-seal mutation -- can call the one required verification entry point
+    without each restating a whole deployment manifest.
+
+    The property it cannot check is checked by
+    `test_seal_rejects_rehashed_receipt_startup_rewrite`, which supplies an
+    independent expectation. Do not use this helper to make a claim about
+    deployment binding.
+    """
+    from gladius_vllm.receipt import DeploymentExpectation
+
+    receipt = json.loads((Path(policy_dir) / "server_start_receipt.json").read_text())
+    payload = deployment_manifest_payload(
+        **{
+            field: receipt[field]
+            for field in deployment_manifest_payload()
+            if field in receipt
+        }
+    )
+    return DeploymentExpectation.from_dict(payload)

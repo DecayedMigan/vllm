@@ -20,14 +20,18 @@ plumbing, to keep this a pure additive plugin):
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from gladius_vllm.application import PolicyApplicationWriter
+from gladius_vllm.digest import sha256_file
+from gladius_vllm.evidence_codes import SEAL_SCHEMA_INVALID
 from gladius_vllm.policy import PolicyLoader
-from gladius_vllm.receipt import publish_startup_attestation
+from gladius_vllm.receipt import publish_startup_attestation, resolve_attestation_nonce
 from gladius_vllm.registry import register_scheduler
 from gladius_vllm.schema import (
     DEFAULT_POLICY_POLL_INTERVAL_MS,
@@ -35,8 +39,23 @@ from gladius_vllm.schema import (
     resolve_engine_id,
     resolve_model_id,
 )
-from gladius_vllm.telemetry import TelemetryWriter
+from gladius_vllm.seal_lifecycle import (
+    ACK_REFUSED,
+    ACK_SEALED,
+    SEAL_REQUEST_FILENAME,
+    classify_refusal,
+    parse_seal_request,
+    read_seal_ack,
+    write_seal_ack,
+)
+from gladius_vllm.telemetry import (
+    RETIRED_MARKER_FILENAME,
+    TELEMETRY_SEAL_FILENAME,
+    TelemetryWriter,
+)
 from vllm.v1.core.sched.scheduler import Scheduler
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -88,6 +107,13 @@ class GladiusScheduler(Scheduler):
 
         policy_dir_env = os.environ.get("GLADIUS_POLICY_DIR")
         policy_dir = Path(policy_dir_env) if policy_dir_env else None
+        self._policy_dir = policy_dir
+        # The deployment manifest this server was launched against, so a seal
+        # request written for a *different* deployment is refused rather than
+        # silently certifying whatever is running.
+        self._deployment_manifest_sha256 = (
+            os.environ.get("GLADIUS_DEPLOYMENT_MANIFEST_SHA256") or None
+        )
         poll_interval_ms = _resolve_poll_interval_ms()
 
         self._policy_loader = PolicyLoader(
@@ -177,11 +203,88 @@ class GladiusScheduler(Scheduler):
             server_instance_id=server_instance_id,
             generation_high_watermark=generation_high_watermark,
         )
+        # The production caller `seal_telemetry()` never had. Placed after
+        # both writers so a seal certifies this step too, and at the end of
+        # schedule() so it is a safe boundary: no partial step is in flight.
+        self._poll_seal_request()
         return output
 
-    def seal_telemetry(self, manifest_path: Path) -> bool:
-        """Certify the current experiment stream and reject later writes."""
-        return self._telemetry_writer.seal(manifest_path)
+    def _poll_seal_request(self) -> None:
+        """Honour an operator's seal request at a safe scheduling boundary.
+
+        Called once per `schedule()`, after the step's telemetry and
+        acknowledgement have been written, so whatever this seals is the
+        complete record of every step that has run. A missing request file
+        is the overwhelmingly common case and costs one `stat()`.
+
+        Fail-open like every other evidence path: a malformed or foreign
+        request is answered with a classified refusal and serving continues.
+        """
+        if self._policy_dir is None or self._telemetry_writer.sealed:
+            return
+        request_path = self._policy_dir / SEAL_REQUEST_FILENAME
+        try:
+            if not request_path.is_file():
+                return
+            request = parse_seal_request(json.loads(request_path.read_text()))
+        except (OSError, ValueError):
+            logger.warning(
+                "GLADIUS: unusable seal request in %s; ignoring",
+                self._policy_dir,
+                exc_info=True,
+            )
+            return
+
+        try:
+            existing = read_seal_ack(self._policy_dir)
+            if existing is not None and existing["request_id"] == request.request_id:
+                # Retrying an identical request is idempotent, so an operator
+                # whose wait timed out can safely ask again.
+                return
+
+            refusal = classify_refusal(
+                request,
+                server_instance_id=self.server_instance_id,
+                deployment_manifest_sha256=self._deployment_manifest_sha256,
+                attestation_nonce=resolve_attestation_nonce(),
+                observed_generation=self._policy_loader.generation_high_watermark,
+                already_retired=(self._policy_dir / RETIRED_MARKER_FILENAME).exists(),
+            )
+            if refusal is not None:
+                code, _, detail = refusal.partition(": ")
+                write_seal_ack(
+                    self._policy_dir,
+                    request=request,
+                    status=ACK_REFUSED,
+                    error_code=code,
+                    error_detail=detail,
+                )
+                logger.warning("GLADIUS refusing seal request: %s", refusal)
+                return
+
+            manifest_path = self._policy_dir / TELEMETRY_SEAL_FILENAME
+            if self._telemetry_writer.seal(manifest_path):
+                write_seal_ack(
+                    self._policy_dir,
+                    request=request,
+                    status=ACK_SEALED,
+                    telemetry_seal_sha256=sha256_file(manifest_path),
+                )
+                logger.info("GLADIUS sealed %s", self._policy_dir)
+            else:
+                write_seal_ack(
+                    self._policy_dir,
+                    request=request,
+                    status=ACK_REFUSED,
+                    error_code=SEAL_SCHEMA_INVALID,
+                    error_detail="the telemetry stream could not be certified",
+                )
+        except Exception:  # noqa: BLE001 - sealing must never break serving
+            logger.warning(
+                "GLADIUS: seal request handling failed for %s",
+                self._policy_dir,
+                exc_info=True,
+            )
 
     def shutdown(self) -> None:
         self._telemetry_writer.close()

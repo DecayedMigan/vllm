@@ -35,7 +35,6 @@ from tests.gladius.evidence_builders import (
     GPU_UUID,
     LISTEN_HOST,
     MODEL_ID,
-    NONCE,
     PCI_BUS_ID,
     application_payload,
     build_sealed_policy_dir,
@@ -152,17 +151,21 @@ def test_seal_rejects_unlisted_and_missing_segments(tmp_path, attack):
     certification while leaving it on disk; the reviewed verifier only ever
     walked the manifest, so an unlisted segment was invisible to it.
     """
-    policy_dir = build_sealed_policy_dir(tmp_path / "gpu0")
+    # Two certified segments, so "omit one" is expressible. An empty file
+    # list would be caught by schema validation before the set comparison.
+    policy_dir = build_sealed_policy_dir(
+        tmp_path / "gpu0", steps=(3, 4), rotated_steps=(1, 2)
+    )
     expectation = _expectation(tmp_path)
     assert _verify(policy_dir, expectation) == []
 
     manifest_path = policy_dir / "telemetry_seal.json"
     manifest = json.loads(manifest_path.read_text())
     if attack == "unlisted_extra_segment":
-        extra = policy_dir / "telemetry.jsonl.1754130000-1"
+        extra = policy_dir / "telemetry.jsonl.1754140000-2"
         extra.write_text(json.dumps(telemetry_record(99)) + "\n")
     elif attack == "omitted_listed_segment":
-        manifest["files"] = []
+        manifest["files"] = manifest["files"][:1]
         manifest_path.write_text(json.dumps(manifest))
     else:
         manifest["files"] = manifest["files"] + list(manifest["files"])
@@ -331,6 +334,7 @@ class _FakeNvml:
         self.uuids = {
             "handle-pci": by_pci,
             "handle-uuid": by_uuid,
+            "handle-parent": "GPU-aaaabbbb-cccc-dddd-eeee-ffff00001111",
         }
 
     def nvmlInit(self) -> None:  # noqa: N802 - NVML's own spelling
@@ -354,6 +358,9 @@ class _FakeNvml:
 
     def nvmlDeviceGetName(self, handle):  # noqa: N802
         return "NVIDIA H100 80GB HBM3"
+
+    def nvmlDeviceGetDeviceHandleFromMigDeviceHandle(self, handle):  # noqa: N802
+        return _FakeNvmlHandle("handle-parent")
 
 
 def test_gpu_resolution_rejects_cuda_nvml_disagreement():
@@ -417,24 +424,28 @@ def test_live_server_seal_request_creates_terminal_artifacts(tmp_path, monkeypat
         SEAL_REQUEST_FILENAME,
         write_seal_request,
     )
-
     from tests.gladius.scheduler_harness import build_cpu_gladius_scheduler
 
     policy_dir = tmp_path / "gpu0"
     policy_dir.mkdir()
-    scheduler = build_cpu_gladius_scheduler(policy_dir, monkeypatch)
+    nonce = "a" * 64
+    scheduler = build_cpu_gladius_scheduler(
+        policy_dir, monkeypatch, attest=True, nonce=nonce
+    )
 
     # The scheduler must have written telemetry before anything can be
-    # sealed; drive a few real scheduling steps first.
+    # sealed; drive a few real scheduling steps first. The first step is
+    # also what lets the binding adopt the published receipt.
     for _ in range(3):
         scheduler.schedule()
+    assert scheduler.server_instance_id is not None
 
     write_seal_request(
         policy_dir,
         server_instance_id=scheduler.server_instance_id,
         deployment_manifest_sha256="0" * 64,
         expected_final_generation=None,
-        attestation_nonce=NONCE,
+        attestation_nonce=nonce,
     )
     assert (policy_dir / SEAL_REQUEST_FILENAME).is_file()
 

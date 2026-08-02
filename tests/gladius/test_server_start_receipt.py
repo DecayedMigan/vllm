@@ -23,14 +23,16 @@ from gladius_vllm.digest import (
 from gladius_vllm.receipt import (
     ENGINE_CONTRIBUTION_FILENAME,
     RECEIPT_FILENAME,
+    DeploymentExpectation,
     ReceiptError,
     ServerInstanceBinding,
     assemble_server_start_receipt,
     parse_engine_contribution,
     parse_server_start_receipt,
     read_server_start_receipt,
-    verify_server_start_receipt,
+    verify_receipt_against_deployment,
 )
+from tests.gladius.evidence_builders import deployment_manifest_payload
 
 NONCE = "b6f4c1d0e9a8b7c6d5e4f30219283746b6f4c1d0e9a8b7c6d5e4f30219283746"
 GPU_UUID = "GPU-11112222-3333-4444-5555-666677778888"
@@ -54,6 +56,10 @@ def _contribution(**overrides) -> dict:
         "cuda_visible_devices": "0",
         "physical_gpu_uuid": GPU_UUID,
         "physical_gpu_name": "NVIDIA H100 80GB HBM3",
+        "physical_gpu_identity_source": "cuda-nvml-corroborated",
+        "mig_uuid": None,
+        "mig_profile": None,
+        "mig_parent_gpu_uuid": None,
         "model_path": "/models/Qwen3-8B",
         "model_tree_sha256": _sha("model"),
         "tokenizer_tree_sha256": _sha("tokenizer"),
@@ -219,6 +225,29 @@ def test_assembly_requires_the_engine_core_contribution(tmp_path):
 # --- required test 2: receipt parsing rejects every mismatch -------------
 
 
+def _expectation(**overrides) -> DeploymentExpectation:
+    """The whole immutable expectation, matching `_contribution()`'s values.
+
+    Formal verification has exactly one entry point and it consumes all of
+    this, so a test that wants a mismatch overrides one field rather than
+    omitting an argument.
+    """
+    payload = deployment_manifest_payload(
+        engine_id="gladius-h100-gpu0",
+        model_id="/models/Qwen3-8B",
+        model_path="/models/Qwen3-8B",
+        physical_gpu_uuid=GPU_UUID,
+        model_tree_sha256=_sha("model"),
+        tokenizer_tree_sha256=_sha("tokenizer"),
+        vllm_package_tree_sha256=_sha("vllm"),
+        vllm_native_binary_sha256=_sha("native"),
+        gladius_overlay_tree_sha256=_sha("overlay"),
+        attestation_nonce=NONCE,
+    )
+    payload.update(overrides)
+    return DeploymentExpectation.from_dict(payload)
+
+
 def _published(tmp_path: Path, **overrides):
     _publish_contribution(tmp_path, **overrides)
     return assemble_server_start_receipt(
@@ -234,26 +263,22 @@ def test_verify_rejects_wrong_nonce_gpu_engine_and_endpoint(tmp_path):
     receipt = _published(tmp_path)
 
     assert (
-        verify_server_start_receipt(
-            receipt,
-            expected_nonce=NONCE,
-            expected_engine_id="gladius-h100-gpu0",
-            expected_model_id="/models/Qwen3-8B",
-            expected_listen_host="127.0.0.1",
-            expected_listen_port=8000,
-            expected_gpu_uuid=GPU_UUID,
+        verify_receipt_against_deployment(
+            receipt, _expectation(), recheck_socket_owner=False
         )
         == []
     )
 
-    errors = verify_server_start_receipt(
+    errors = verify_receipt_against_deployment(
         receipt,
-        expected_nonce="f" * 64,
-        expected_engine_id="other-engine",
-        expected_listen_port=8001,
-        expected_gpu_uuid="GPU-not-this-one",
+        _expectation(
+            attestation_nonce="f" * 64,
+            engine_id="other-engine",
+            listen_port=8001,
+            physical_gpu_uuid="GPU-not-this-one",
+        ),
+        recheck_socket_owner=False,
     )
-    assert len(errors) == 4
     assert any("attestation_nonce" in error for error in errors)
     assert any("engine_id" in error for error in errors)
     assert any("listen_port" in error for error in errors)
@@ -263,8 +288,10 @@ def test_verify_rejects_wrong_nonce_gpu_engine_and_endpoint(tmp_path):
 def test_verify_rejects_an_altered_digest(tmp_path):
     receipt = _published(tmp_path)
 
-    errors = verify_server_start_receipt(
-        receipt, expected_digests={"model_tree_sha256": _sha("a different model")}
+    errors = verify_receipt_against_deployment(
+        receipt,
+        _expectation(model_tree_sha256=_sha("a different model")),
+        recheck_socket_owner=False,
     )
 
     assert len(errors) == 1
@@ -288,7 +315,9 @@ def test_formal_verification_rejects_a_startup_configuration_mismatch(
 ):
     receipt = _published(tmp_path, **{field: value})
 
-    errors = verify_server_start_receipt(receipt, require_formal_startup=True)
+    errors = verify_receipt_against_deployment(
+        receipt, _expectation(), recheck_socket_owner=False
+    )
 
     assert [error for error in errors if field in error], errors
 
@@ -310,7 +339,9 @@ def test_verify_detects_a_replaced_process(tmp_path):
         physical_gpu_uuid=payload["physical_gpu_uuid"],
     )
 
-    errors = verify_server_start_receipt(parse_server_start_receipt(payload))
+    errors = verify_receipt_against_deployment(
+        parse_server_start_receipt(payload), _expectation(), recheck_socket_owner=False
+    )
 
     assert any("was replaced" in error for error in errors)
     assert receipt.engine_core_pid == os.getpid()
@@ -341,7 +372,9 @@ def test_verify_reports_a_dead_process(tmp_path):
         physical_gpu_uuid=payload["physical_gpu_uuid"],
     )
 
-    errors = verify_server_start_receipt(parse_server_start_receipt(payload))
+    errors = verify_receipt_against_deployment(
+        parse_server_start_receipt(payload), _expectation(), recheck_socket_owner=False
+    )
 
     assert any("no longer running" in error for error in errors)
     assert receipt.server_instance_id != payload["server_instance_id"]

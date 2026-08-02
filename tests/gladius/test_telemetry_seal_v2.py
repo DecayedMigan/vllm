@@ -24,6 +24,9 @@ from gladius_vllm.telemetry import (
     TelemetryWriter,
     verify_telemetry_seal,
 )
+from tests.gladius.evidence_builders import (
+    expectation_matching_receipt_on_disk,
+)
 
 SHARED_FIXTURE = json.loads(
     (
@@ -108,19 +111,37 @@ def _record(step: int, *, instance: str | None = INSTANCE) -> dict:
     }
 
 
-def _write_siblings(tmp_path: Path) -> None:
+def _write_siblings(tmp_path: Path, *, final_step: int | None = None) -> None:
     """Publish a real receipt and acknowledgement for the sealed instance.
 
     A seal now binds both siblings *semantically*, so a placeholder stub is
     no longer enough -- which is the point: the reviewed revision sealed
     happily with neither file present.
+
+    `final_step` re-points the acknowledgement at a step the telemetry under
+    test actually contains. A live server can only ever acknowledge a step it
+    has run, so evidence where it does not is incoherent rather than merely
+    inconvenient.
     """
     (tmp_path / SERVER_START_RECEIPT_FILENAME).write_text(
         json.dumps(SHARED_FIXTURE["valid_server_start_receipt"], sort_keys=True)
     )
+    application = dict(SHARED_FIXTURE["valid_applications"]["active"])
+    if final_step is not None:
+        application["scheduler_step"] = final_step
     (tmp_path / POLICY_APPLICATION_FILENAME).write_text(
-        json.dumps(SHARED_FIXTURE["valid_applications"]["active"], sort_keys=True)
+        json.dumps(application, sort_keys=True)
     )
+
+
+def _last_step(lines: list[str]) -> int | None:
+    """The final parseable step in a set of raw telemetry lines."""
+    for line in reversed(lines):
+        try:
+            return int(json.loads(line)["step"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            continue
+    return None
 
 
 def _seal_prewritten(
@@ -129,7 +150,7 @@ def _seal_prewritten(
     path = tmp_path / "telemetry.jsonl"
     path.write_text("".join(f"{line}\n" for line in lines))
     if with_siblings:
-        _write_siblings(tmp_path)
+        _write_siblings(tmp_path, final_step=_last_step(lines))
     writer = TelemetryWriter(path=path, engine_id=ENGINE_ID, model_id=MODEL_ID)
     return writer.seal(tmp_path / "telemetry_seal.json")
 
@@ -224,7 +245,14 @@ def test_seal_binds_the_receipt_and_the_final_application(tmp_path):
         manifest["policy_application_sha256"]
         == hashlib.sha256(application_text.encode()).hexdigest()
     )
-    assert verify_telemetry_seal(tmp_path / "telemetry_seal.json", tmp_path) == []
+    assert (
+        verify_telemetry_seal(
+            tmp_path / "telemetry_seal.json",
+            tmp_path,
+            expectation=expectation_matching_receipt_on_disk(tmp_path),
+        )
+        == []
+    )
 
 
 @pytest.mark.parametrize(
@@ -240,7 +268,11 @@ def test_verification_detects_a_post_seal_alteration(tmp_path, filename, expecte
 
     (tmp_path / filename).write_text(json.dumps(_record(9)) + "\n")
 
-    errors = verify_telemetry_seal(tmp_path / "telemetry_seal.json", tmp_path)
+    errors = verify_telemetry_seal(
+        tmp_path / "telemetry_seal.json",
+        tmp_path,
+        expectation=expectation_matching_receipt_on_disk(tmp_path),
+    )
     assert any(expected in error for error in errors), errors
 
 
@@ -248,8 +280,13 @@ def test_verification_detects_a_missing_certified_segment(tmp_path):
     assert _seal_prewritten(tmp_path, [json.dumps(_record(1))]) is True
     (tmp_path / "telemetry.jsonl").unlink()
 
-    errors = verify_telemetry_seal(tmp_path / "telemetry_seal.json", tmp_path)
-    assert any("is missing" in error for error in errors), errors
+    errors = verify_telemetry_seal(
+        tmp_path / "telemetry_seal.json",
+        tmp_path,
+        expectation=expectation_matching_receipt_on_disk(tmp_path),
+    )
+    assert any("listed-but-missing" in error for error in errors), errors
+    assert any(error.startswith("SEAL_SEGMENT_SET_MISMATCH") for error in errors)
 
 
 def test_verification_rejects_a_seal_that_certifies_nothing(tmp_path):
@@ -269,7 +306,12 @@ def test_verification_rejects_a_seal_that_certifies_nothing(tmp_path):
         )
     )
 
-    errors = verify_telemetry_seal(manifest_path, tmp_path)
+    _write_siblings(tmp_path)
+    errors = verify_telemetry_seal(
+        manifest_path,
+        tmp_path,
+        expectation=expectation_matching_receipt_on_disk(tmp_path),
+    )
     assert any("telemetry seal unusable" in error for error in errors)
 
 
@@ -279,7 +321,7 @@ def test_verification_rejects_a_seal_that_certifies_nothing(tmp_path):
 def test_scheduling_continues_and_certified_bytes_stay_identical(tmp_path):
     path = tmp_path / "telemetry.jsonl"
     manifest_path = tmp_path / "telemetry_seal.json"
-    _write_siblings(tmp_path)
+    _write_siblings(tmp_path, final_step=3)
     writer = TelemetryWriter(path=path, engine_id=ENGINE_ID, model_id=MODEL_ID)
     scheduler = _fake_scheduler()
     output = _fake_output()
@@ -312,4 +354,11 @@ def test_scheduling_continues_and_certified_bytes_stay_identical(tmp_path):
     assert writer.sealed is True
     assert writer.step == 8
     assert path.read_bytes() == certified
-    assert verify_telemetry_seal(manifest_path, tmp_path) == []
+    assert (
+        verify_telemetry_seal(
+            manifest_path,
+            tmp_path,
+            expectation=expectation_matching_receipt_on_disk(tmp_path),
+        )
+        == []
+    )
