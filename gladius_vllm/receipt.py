@@ -302,6 +302,108 @@ def read_server_start_receipt(path: Path) -> ServerStartReceipt:
     return parse_server_start_receipt(json.loads(Path(path).read_text()))
 
 
+DEPLOYMENT_MANIFEST_FIELDS = frozenset(
+    {
+        "schema_version",
+        "attestation_nonce",
+        "engine_id",
+        "model_id",
+        "listen_host",
+        "listen_port",
+        "physical_gpu_uuid",
+        "model_tree_sha256",
+        "tokenizer_tree_sha256",
+        "vllm_package_tree_sha256",
+        "vllm_native_binary_sha256",
+        "gladius_overlay_tree_sha256",
+        "tree_hash_algorithm_version",
+    }
+)
+
+
+@dataclass(frozen=True)
+class DeploymentExpectation:
+    """What the campaign says one lane's server must be.
+
+    Formal verification consumes exactly this. Making every expectation
+    optional (the reviewed behaviour) meant a caller that simply passed
+    nothing got a "valid" receipt while every digest went unchecked -- a
+    skipped check reported as a pass.
+    """
+
+    attestation_nonce: str
+    engine_id: str
+    model_id: str
+    listen_host: str
+    listen_port: int
+    physical_gpu_uuid: str
+    model_tree_sha256: str
+    tokenizer_tree_sha256: str
+    vllm_package_tree_sha256: str
+    vllm_native_binary_sha256: str
+    gladius_overlay_tree_sha256: str
+    tree_hash_algorithm_version: str
+
+    @property
+    def digests(self) -> dict[str, str]:
+        return {field: getattr(self, field) for field in _DIGEST_FIELDS}
+
+    @classmethod
+    def from_dict(cls, payload: object) -> DeploymentExpectation:
+        if not isinstance(payload, dict):
+            raise ReceiptError("deployment manifest must be a JSON object")
+        fields = set(payload)
+        if fields != set(DEPLOYMENT_MANIFEST_FIELDS):
+            missing = sorted(DEPLOYMENT_MANIFEST_FIELDS - fields)
+            unknown = sorted(fields - DEPLOYMENT_MANIFEST_FIELDS)
+            raise ReceiptError(
+                f"deployment manifest fields mismatch: missing={missing}, "
+                f"unknown={unknown}"
+            )
+        if payload["schema_version"] != EXECUTION_EVIDENCE_SCHEMA_VERSION:
+            raise ReceiptError(
+                "deployment manifest requires execution-evidence schema "
+                f"{EXECUTION_EVIDENCE_SCHEMA_VERSION}"
+            )
+        for field in _DIGEST_FIELDS:
+            _require_digest(payload, field)
+        _require_positive_int(payload, "listen_port")
+        for field in (
+            "attestation_nonce",
+            "engine_id",
+            "model_id",
+            "listen_host",
+            "physical_gpu_uuid",
+            "tree_hash_algorithm_version",
+        ):
+            _require_text(payload, field)
+        return cls(
+            **{key: value for key, value in payload.items() if key != "schema_version"}
+        )
+
+    @classmethod
+    def from_file(cls, path: Path) -> DeploymentExpectation:
+        return cls.from_dict(json.loads(Path(path).read_text()))
+
+
+def verify_receipt_against_deployment(
+    receipt: ServerStartReceipt, expectation: DeploymentExpectation
+) -> list[str]:
+    """The one strict path the CLI, the Python API, and SMIG all use."""
+    return verify_server_start_receipt(
+        receipt,
+        expected_nonce=expectation.attestation_nonce,
+        expected_engine_id=expectation.engine_id,
+        expected_model_id=expectation.model_id,
+        expected_listen_host=expectation.listen_host,
+        expected_listen_port=expectation.listen_port,
+        expected_gpu_uuid=expectation.physical_gpu_uuid,
+        expected_digests=expectation.digests,
+        expected_tree_hash_algorithm_version=(expectation.tree_hash_algorithm_version),
+        require_formal_startup=True,
+    )
+
+
 def verify_server_start_receipt(
     receipt: ServerStartReceipt,
     *,
@@ -314,14 +416,44 @@ def verify_server_start_receipt(
     expected_api_pid: int | None = None,
     expected_engine_core_pid: int | None = None,
     expected_digests: dict[str, str] | None = None,
+    expected_tree_hash_algorithm_version: str | None = None,
     require_formal_startup: bool = False,
 ) -> list[str]:
     """Return every way `receipt` disagrees with what the campaign expected.
 
     Returns a list rather than raising on the first problem so an operator
     sees the complete diagnosis of a mis-launched server in one pass.
+
+    Prefer `verify_receipt_against_deployment()` for anything formal: it
+    supplies every expectation from one immutable manifest, so no check can
+    be silently skipped by omitting an argument.
     """
     errors: list[str] = []
+    if require_formal_startup:
+        missing_expectations = [
+            name
+            for name, value in (
+                ("nonce", expected_nonce),
+                ("engine_id", expected_engine_id),
+                ("model_id", expected_model_id),
+                ("listen_host", expected_listen_host),
+                ("listen_port", expected_listen_port),
+                ("gpu_uuid", expected_gpu_uuid),
+                ("digests", expected_digests),
+            )
+            if value is None
+        ]
+        if missing_expectations:
+            errors.append(
+                "formal verification is missing expectations for "
+                f"{sorted(missing_expectations)}; a skipped check is not a pass"
+            )
+        if expected_digests is not None:
+            absent = sorted(set(_DIGEST_FIELDS) - set(expected_digests))
+            if absent:
+                errors.append(
+                    f"formal verification is missing expected digests for {absent}"
+                )
 
     def check(name: str, expected: object, actual: object) -> None:
         if expected is not None and expected != actual:
@@ -335,6 +467,12 @@ def verify_server_start_receipt(
     check("physical_gpu_uuid", expected_gpu_uuid, receipt.physical_gpu_uuid)
     check("api_pid", expected_api_pid, receipt.api_pid)
     check("engine_core_pid", expected_engine_core_pid, receipt.engine_core_pid)
+
+    check(
+        "tree_hash_algorithm_version",
+        expected_tree_hash_algorithm_version,
+        receipt.tree_hash_algorithm_version,
+    )
 
     for field, expected_digest in (expected_digests or {}).items():
         if field not in _DIGEST_FIELDS:
@@ -384,40 +522,105 @@ def _resolve_physical_gpu(device_index: int = 0) -> tuple[str, str]:
         return value.decode() if isinstance(value, bytes) else str(value)
 
     torch_properties = None
+    pci_bus_id: str | None = None
+    cuda_uuid: str | None = None
     try:
         import torch
 
         if torch.cuda.is_available():
             device_index = torch.cuda.current_device()
             torch_properties = torch.cuda.get_device_properties(device_index)
+            raw_uuid = getattr(torch_properties, "uuid", None)
+            if raw_uuid is not None:
+                cuda_uuid = _text(raw_uuid)
+            # `torch.cuda.get_device_properties` does not expose the PCI bus
+            # id on every build, so fall back to the CUDA runtime's own
+            # formatted string when it is available.
+            getter = getattr(torch.cuda, "get_device_pci_bus_id", None)
+            if callable(getter):
+                pci_bus_id = _text(getter(device_index))
+            elif torch_properties is not None:
+                domain = getattr(torch_properties, "pci_domain_id", None)
+                bus = getattr(torch_properties, "pci_bus_id", None)
+                device = getattr(torch_properties, "pci_device_id", None)
+                if None not in (domain, bus, device):
+                    pci_bus_id = f"{domain:08X}:{bus:02X}:{device:02X}.0"
     except Exception:  # noqa: BLE001 - torch import/probe must not break startup
         logger.debug("GLADIUS: torch device probe unavailable", exc_info=True)
 
-    # NVML is authoritative on the formal NVIDIA target and reports the same
-    # UUID string an operator sees from `nvidia-smi`, so it is tried first.
     nvml_error: Exception | None = None
     try:
         from vllm.third_party import pynvml
 
         pynvml.nvmlInit()
         try:
-            handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+            handle = _resolve_nvml_handle(
+                pynvml, pci_bus_id=pci_bus_id, cuda_uuid=cuda_uuid
+            )
             return (
                 _text(pynvml.nvmlDeviceGetUUID(handle)),
                 _text(pynvml.nvmlDeviceGetName(handle)),
             )
         finally:
             pynvml.nvmlShutdown()
+    except DigestError:
+        raise
     except Exception as exc:  # noqa: BLE001 - NVML is absent on ROCm/CPU hosts
         nvml_error = exc
 
     # Fallback for non-NVIDIA development hosts (ROCm): torch reports the
     # device it actually bound, which is still a measurement from inside the
     # model process rather than an inference from CUDA_VISIBLE_DEVICES.
-    uuid_value = getattr(torch_properties, "uuid", None)
-    if uuid_value is not None:
-        return _text(uuid_value), _text(getattr(torch_properties, "name", "unknown"))
+    if cuda_uuid is not None:
+        return cuda_uuid, _text(getattr(torch_properties, "name", "unknown"))
     raise DigestError(f"cannot read physical GPU identity: {nvml_error}")
+
+
+def _resolve_nvml_handle(pynvml: Any, *, pci_bus_id: str | None, cuda_uuid: str | None):
+    """Cross the CUDA/NVML namespace boundary by device identity, not ordinal.
+
+    CUDA device indices are *logical* -- renumbered inside
+    `CUDA_VISIBLE_DEVICES` -- while NVML indices are physical machine
+    ordinals that the environment variable does not remap. Under the
+    required one-process-per-GPU launch every replica sees logical device 0,
+    so passing that ordinal to `nvmlDeviceGetHandleByIndex` (the reviewed
+    behaviour) would report physical GPU 0 for all four replicas and destroy
+    the exact property the receipt exists to prove.
+
+    PCI bus id and the CUDA device UUID are both physical identities, so
+    either one resolves the correct NVML handle regardless of masking. If
+    neither is available, this raises rather than guessing.
+    """
+    if pci_bus_id:
+        try:
+            return pynvml.nvmlDeviceGetHandleByPciBusId(pci_bus_id.encode())
+        except Exception as error:  # noqa: BLE001 - fall through to the UUID path
+            logger.debug(
+                "GLADIUS: NVML lookup by PCI bus id %s failed",
+                pci_bus_id,
+                exc_info=True,
+            )
+            pci_error = error
+    else:
+        pci_error = None
+
+    if cuda_uuid:
+        # CUDA reports `GPU-<uuid>` or a bare uuid depending on version;
+        # NVML's own lookup accepts the prefixed form.
+        candidate = cuda_uuid if cuda_uuid.startswith("GPU-") else f"GPU-{cuda_uuid}"
+        try:
+            return pynvml.nvmlDeviceGetHandleByUUID(candidate.encode())
+        except Exception as error:  # noqa: BLE001 - reported below
+            raise DigestError(
+                "cannot map the bound CUDA device to a physical NVML device "
+                f"(pci_bus_id={pci_bus_id!r}: {pci_error}; uuid={candidate!r}: {error})"
+            ) from error
+
+    raise DigestError(
+        "cannot map the bound CUDA device to a physical NVML device: neither a "
+        "PCI bus id nor a CUDA device UUID was observable, and a logical "
+        "ordinal is not a physical one"
+    )
 
 
 def collect_engine_contribution(
@@ -531,6 +734,23 @@ def assemble_server_start_receipt(
             "it belongs to another launch"
         )
 
+    # The EngineCore's own identity is re-read here, immediately before the
+    # receipt is minted. A process that died or was replaced between
+    # publishing its contribution and being attested must not be certified.
+    engine_core_pid = int(contribution["engine_core_pid"])
+    try:
+        live_engine_identity = process_start_identity(engine_core_pid)
+    except DigestError as error:
+        raise ReceiptError(
+            f"EngineCore process {engine_core_pid} is no longer running: {error}"
+        ) from error
+    if live_engine_identity != contribution["engine_core_process_start_identity"]:
+        raise ReceiptError(
+            f"EngineCore process {engine_core_pid} was replaced between "
+            "publishing its contribution and attestation"
+        )
+
+    api_start_identity = process_start_identity(int(api_pid))
     payload = {
         key: value for key, value in contribution.items() if key != "observed_at"
     }
@@ -538,7 +758,7 @@ def assemble_server_start_receipt(
         {
             "created_at": now or format_iso8601(),
             "api_pid": int(api_pid),
-            "api_process_start_identity": process_start_identity(int(api_pid)),
+            "api_process_start_identity": api_start_identity,
             "listen_host": listen_host,
             "listen_port": int(listen_port),
         }
@@ -556,6 +776,13 @@ def assemble_server_start_receipt(
         physical_gpu_uuid=payload["physical_gpu_uuid"],
     )
     receipt = parse_server_start_receipt(payload)
+    # Re-read the API identity too: if it changed while the receipt was being
+    # assembled, the socket the campaign will call is no longer owned by the
+    # process this receipt names.
+    if process_start_identity(int(api_pid)) != api_start_identity:
+        raise ReceiptError(
+            f"API process {api_pid} was replaced during receipt assembly"
+        )
 
     receipt_path = policy_dir / RECEIPT_FILENAME
     if receipt_path.is_file():

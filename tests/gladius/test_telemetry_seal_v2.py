@@ -25,6 +25,15 @@ from gladius_vllm.telemetry import (
     verify_telemetry_seal,
 )
 
+SHARED_FIXTURE = json.loads(
+    (
+        Path(__file__).parent / "fixtures" / "gladius-execution-evidence-v2.json"
+    ).read_text()
+)
+ENGINE_ID = SHARED_FIXTURE["valid_server_start_receipt"]["engine_id"]
+MODEL_ID = SHARED_FIXTURE["valid_server_start_receipt"]["model_id"]
+
+
 INSTANCE = "srv-b98904472fa1ba70b59582d9d249925b"
 OTHER_INSTANCE = "srv-40c55870b15263bf31864a1f3e1087d6"
 
@@ -75,8 +84,8 @@ def _record(step: int, *, instance: str | None = INSTANCE) -> dict:
         "policy_id": "policy-42",
         "decision_id": "policy-42",
         "window_id": None,
-        "model_id": "m",
-        "engine_id": "e",
+        "model_id": MODEL_ID,
+        "engine_id": ENGINE_ID,
         "created_at": "2026-08-02T09:05:00Z",
         "expires_at": None,
         "step": step,
@@ -99,10 +108,29 @@ def _record(step: int, *, instance: str | None = INSTANCE) -> dict:
     }
 
 
-def _seal_prewritten(tmp_path: Path, lines: list[str]) -> bool:
+def _write_siblings(tmp_path: Path) -> None:
+    """Publish a real receipt and acknowledgement for the sealed instance.
+
+    A seal now binds both siblings *semantically*, so a placeholder stub is
+    no longer enough -- which is the point: the reviewed revision sealed
+    happily with neither file present.
+    """
+    (tmp_path / SERVER_START_RECEIPT_FILENAME).write_text(
+        json.dumps(SHARED_FIXTURE["valid_server_start_receipt"], sort_keys=True)
+    )
+    (tmp_path / POLICY_APPLICATION_FILENAME).write_text(
+        json.dumps(SHARED_FIXTURE["valid_applications"]["active"], sort_keys=True)
+    )
+
+
+def _seal_prewritten(
+    tmp_path: Path, lines: list[str], *, with_siblings: bool = True
+) -> bool:
     path = tmp_path / "telemetry.jsonl"
     path.write_text("".join(f"{line}\n" for line in lines))
-    writer = TelemetryWriter(path=path, engine_id="e", model_id="m")
+    if with_siblings:
+        _write_siblings(tmp_path)
+    writer = TelemetryWriter(path=path, engine_id=ENGINE_ID, model_id=MODEL_ID)
     return writer.seal(tmp_path / "telemetry_seal.json")
 
 
@@ -164,7 +192,8 @@ def test_sealing_orders_rotated_segments_numerically(tmp_path):
         json.dumps(_record(2)) + "\n"
     )
     path.write_text(json.dumps(_record(3)) + "\n")
-    writer = TelemetryWriter(path=path, engine_id="e", model_id="m")
+    _write_siblings(tmp_path)
+    writer = TelemetryWriter(path=path, engine_id=ENGINE_ID, model_id=MODEL_ID)
 
     assert writer.seal(tmp_path / "telemetry_seal.json") is True
 
@@ -180,12 +209,9 @@ def test_sealing_orders_rotated_segments_numerically(tmp_path):
 
 
 def test_seal_binds_the_receipt_and_the_final_application(tmp_path):
-    receipt_text = '{"server_instance_id": "srv-x"}'
-    application_text = '{"state": "active"}'
-    (tmp_path / SERVER_START_RECEIPT_FILENAME).write_text(receipt_text)
-    (tmp_path / POLICY_APPLICATION_FILENAME).write_text(application_text)
-
     assert _seal_prewritten(tmp_path, [json.dumps(_record(1))]) is True
+    receipt_text = (tmp_path / SERVER_START_RECEIPT_FILENAME).read_text()
+    application_text = (tmp_path / POLICY_APPLICATION_FILENAME).read_text()
 
     manifest = json.loads((tmp_path / "telemetry_seal.json").read_text())
     assert manifest["server_instance_id"] == INSTANCE
@@ -210,8 +236,6 @@ def test_seal_binds_the_receipt_and_the_final_application(tmp_path):
     ],
 )
 def test_verification_detects_a_post_seal_alteration(tmp_path, filename, expected):
-    (tmp_path / SERVER_START_RECEIPT_FILENAME).write_text('{"a": 1}')
-    (tmp_path / POLICY_APPLICATION_FILENAME).write_text('{"b": 2}')
     assert _seal_prewritten(tmp_path, [json.dumps(_record(1))]) is True
 
     (tmp_path / filename).write_text(json.dumps(_record(9)) + "\n")
@@ -246,8 +270,7 @@ def test_verification_rejects_a_seal_that_certifies_nothing(tmp_path):
     )
 
     errors = verify_telemetry_seal(manifest_path, tmp_path)
-    assert any("certifies no segments" in error for error in errors)
-    assert any("certifies no records" in error for error in errors)
+    assert any("telemetry seal unusable" in error for error in errors)
 
 
 # --- required test 9: sealing freezes evidence without stopping serving --
@@ -256,7 +279,8 @@ def test_verification_rejects_a_seal_that_certifies_nothing(tmp_path):
 def test_scheduling_continues_and_certified_bytes_stay_identical(tmp_path):
     path = tmp_path / "telemetry.jsonl"
     manifest_path = tmp_path / "telemetry_seal.json"
-    writer = TelemetryWriter(path=path, engine_id="e", model_id="m")
+    _write_siblings(tmp_path)
+    writer = TelemetryWriter(path=path, engine_id=ENGINE_ID, model_id=MODEL_ID)
     scheduler = _fake_scheduler()
     output = _fake_output()
     for _ in range(3):

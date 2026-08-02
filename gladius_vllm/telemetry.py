@@ -23,8 +23,11 @@ from gladius_vllm.schema import (
     DEFAULT_TELEMETRY_MAX_BYTES,
     DEFAULT_TELEMETRY_SAMPLE_N,
     EXECUTION_EVIDENCE_SCHEMA_VERSION,
+    POLICY_SOURCES,
+    POLICY_STATUSES,
     format_iso8601,
     parse_int_env,
+    parse_iso8601,
 )
 
 if TYPE_CHECKING:
@@ -34,36 +37,137 @@ logger = logging.getLogger(__name__)
 
 POLICY_APPLICATION_FILENAME = "policy_application.json"
 SERVER_START_RECEIPT_FILENAME = "server_start_receipt.json"
+TELEMETRY_SEAL_FILENAME = "telemetry_seal.json"
+RETIRED_MARKER_FILENAME = "RETIRED"
+
+
+def _is_retired(policy_dir: Path) -> bool:
+    """True once a directory holds certified evidence that must not change."""
+    return (policy_dir / TELEMETRY_SEAL_FILENAME).exists() or (
+        policy_dir / RETIRED_MARKER_FILENAME
+    ).exists()
+
+
+def retire_policy_directory(policy_dir: Path) -> None:
+    """Mark a policy directory closed to any further telemetry writer."""
+    policy_dir = Path(policy_dir)
+    policy_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(
+        policy_dir / RETIRED_MARKER_FILENAME,
+        {
+            "schema_version": EXECUTION_EVIDENCE_SCHEMA_VERSION,
+            "retired_at": format_iso8601(),
+        },
+    )
 
 
 class TelemetrySealError(ValueError):
     """A telemetry stream could not be certified as immutable evidence."""
 
 
+# The exact field set the writer emits. Formal evidence parsing requires
+# all of it and nothing else: a record with an unknown field was produced by
+# code this contract does not describe, and one with a missing field cannot
+# be validated at all.
+TELEMETRY_RECORD_FIELDS = frozenset(
+    {
+        "schema_version",
+        "server_instance_id",
+        "generation_high_watermark",
+        "generation",
+        "policy_id",
+        "decision_id",
+        "window_id",
+        "model_id",
+        "engine_id",
+        "created_at",
+        "expires_at",
+        "step",
+        "num_running_reqs",
+        "num_waiting_reqs",
+        "num_skipped_waiting_reqs",
+        "num_scheduled_reqs",
+        "num_scheduled_tokens",
+        "num_prefill_reqs",
+        "num_decode_reqs",
+        "kv_cache_usage",
+        "policy_status",
+        "policy_source",
+        "requested_admission",
+        "effective_admission",
+        "clamped",
+        "policy_poll_ns",
+        "policy_apply_ns",
+        "telemetry_write_ns",
+    }
+)
+_ADMISSION_FIELDS = frozenset({"max_num_seqs", "max_num_batched_tokens"})
+_COUNTER_FIELDS = (
+    "num_running_reqs",
+    "num_waiting_reqs",
+    "num_skipped_waiting_reqs",
+    "num_scheduled_reqs",
+    "num_scheduled_tokens",
+    "num_prefill_reqs",
+    "num_decode_reqs",
+    "policy_poll_ns",
+    "policy_apply_ns",
+    "telemetry_write_ns",
+)
+_POLICY_STATUSES = frozenset(POLICY_STATUSES)
+_POLICY_SOURCES = frozenset(POLICY_SOURCES)
+
+
+def _seal_int(payload: dict, field: str, *, minimum: int) -> int:
+    value = payload[field]
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise TelemetrySealError(f"{field} must be an integer >= {minimum}")
+    return value
+
+
+def _seal_admission(payload: dict, field: str) -> tuple[int, int]:
+    block = payload[field]
+    if not isinstance(block, dict) or set(block) != set(_ADMISSION_FIELDS):
+        raise TelemetrySealError(f"{field} does not match the contract")
+    return (
+        _seal_int(block, "max_num_seqs", minimum=1),
+        _seal_int(block, "max_num_batched_tokens", minimum=1),
+    )
+
+
 def parse_telemetry_record_v2(payload: object) -> dict[str, Any]:
     """Strictly validate one execution-evidence 2.0.0 telemetry record.
 
-    The native-state invariant is enforced here rather than repaired: a
-    record claiming a generation but no policy id (or vice versa) describes
-    a scheduler state that cannot exist, so accepting it would mean
-    inventing evidence.
+    Schema-strict: the exact field set, with types, ranges, timestamps,
+    queue/admission values, clamp invariants, policy status/source, and
+    engine/model identity all checked. A subset check would let a record
+    carrying an unrecognised field -- i.e. produced by something other than
+    this writer -- into a formal seal.
+
+    The native-state invariant is enforced rather than repaired: a record
+    claiming a generation but no policy id describes a scheduler state that
+    cannot exist, so accepting it would mean inventing evidence.
     """
     if not isinstance(payload, dict):
         raise TelemetrySealError("telemetry record must be a JSON object")
-    if payload.get("schema_version") != EXECUTION_EVIDENCE_SCHEMA_VERSION:
+    fields = set(payload)
+    if fields != set(TELEMETRY_RECORD_FIELDS):
+        missing = sorted(TELEMETRY_RECORD_FIELDS - fields)
+        unknown = sorted(fields - TELEMETRY_RECORD_FIELDS)
+        raise TelemetrySealError(
+            f"telemetry record fields mismatch: missing={missing}, unknown={unknown}"
+        )
+    if payload["schema_version"] != EXECUTION_EVIDENCE_SCHEMA_VERSION:
         raise TelemetrySealError(
             "telemetry requires execution-evidence schema "
             f"{EXECUTION_EVIDENCE_SCHEMA_VERSION}"
         )
     for field in ("engine_id", "model_id"):
-        if not isinstance(payload.get(field), str) or not payload[field]:
+        if not isinstance(payload[field], str) or not payload[field]:
             raise TelemetrySealError(f"{field} must be a non-empty string")
-    step = payload.get("step")
-    if isinstance(step, bool) or not isinstance(step, int) or step < 1:
-        raise TelemetrySealError("step must be a positive integer")
+    _seal_int(payload, "step", minimum=1)
 
-    identity = (payload.get("generation"), payload.get("policy_id"))
-    identity += (payload.get("decision_id"),)
+    identity = (payload["generation"], payload["policy_id"], payload["decision_id"])
     present = tuple(value is not None for value in identity)
     if len(set(present)) != 1:
         raise TelemetrySealError(
@@ -81,19 +185,86 @@ def parse_telemetry_record_v2(payload: object) -> dict[str, Any]:
         if not isinstance(policy_id, str) or not policy_id:
             raise TelemetrySealError("policy_id must be a non-empty string")
 
-    watermark = payload.get("generation_high_watermark")
-    if watermark is not None and (
-        isinstance(watermark, bool) or not isinstance(watermark, int) or watermark < 0
-    ):
-        raise TelemetrySealError(
-            "generation_high_watermark must be a non-negative integer or null"
-        )
-    if "server_instance_id" not in payload:
-        raise TelemetrySealError("telemetry record must carry server_instance_id")
+    watermark = payload["generation_high_watermark"]
+    if watermark is not None:
+        if (
+            isinstance(watermark, bool)
+            or not isinstance(watermark, int)
+            or watermark < 0
+        ):
+            raise TelemetrySealError(
+                "generation_high_watermark must be a non-negative integer or null"
+            )
+        if present[0] and watermark < payload["generation"]:
+            raise TelemetrySealError(
+                "generation_high_watermark must be >= the applied generation"
+            )
+
     instance = payload["server_instance_id"]
     if instance is not None and (not isinstance(instance, str) or not instance):
         raise TelemetrySealError(
             "server_instance_id must be a non-empty string or null"
+        )
+
+    if payload["window_id"] is not None and not isinstance(payload["window_id"], str):
+        raise TelemetrySealError("window_id must be a string or null")
+    try:
+        parse_iso8601(payload["created_at"])
+    except (TypeError, ValueError) as error:
+        raise TelemetrySealError(f"invalid created_at: {error}") from error
+    if payload["expires_at"] is not None:
+        try:
+            parse_iso8601(payload["expires_at"])
+        except (TypeError, ValueError) as error:
+            raise TelemetrySealError(f"invalid expires_at: {error}") from error
+
+    for field in _COUNTER_FIELDS:
+        _seal_int(payload, field, minimum=0)
+    usage = payload["kv_cache_usage"]
+    if usage is not None:
+        if isinstance(usage, bool) or not isinstance(usage, (int, float)):
+            raise TelemetrySealError("kv_cache_usage must be a number or null")
+        if not 0.0 <= float(usage) <= 1.0:
+            raise TelemetrySealError("kv_cache_usage must be in [0, 1]")
+    if (
+        payload["num_prefill_reqs"] + payload["num_decode_reqs"]
+        != (payload["num_scheduled_reqs"])
+    ):
+        raise TelemetrySealError(
+            "num_prefill_reqs + num_decode_reqs must equal num_scheduled_reqs"
+        )
+
+    if payload["policy_status"] not in _POLICY_STATUSES:
+        raise TelemetrySealError("policy_status is not a known status")
+    if payload["policy_source"] not in _POLICY_SOURCES:
+        raise TelemetrySealError("policy_source is not a known source")
+    # A native/default decision is the only one that can have no identity,
+    # and a file-backed decision always has one.
+    if (payload["policy_source"] == "default") != (not present[0]):
+        raise TelemetrySealError(
+            "policy_source and the identity fields disagree about whether a "
+            "file-backed policy is in force"
+        )
+
+    requested = _seal_admission(payload, "requested_admission")
+    effective = _seal_admission(payload, "effective_admission")
+    clamped_block = payload["clamped"]
+    if not isinstance(clamped_block, dict) or set(clamped_block) != set(
+        _ADMISSION_FIELDS
+    ):
+        raise TelemetrySealError("clamped does not match the contract")
+    clamped = tuple(clamped_block[field] for field in sorted(_ADMISSION_FIELDS))
+    if not all(isinstance(value, bool) for value in clamped):
+        raise TelemetrySealError("clamped values must be boolean")
+    # The clamp flags are derived, not independent: each must say exactly
+    # whether that dimension's effective value differs from the requested one.
+    expected_clamps = {
+        "max_num_seqs": effective[0] != requested[0],
+        "max_num_batched_tokens": effective[1] != requested[1],
+    }
+    if clamped_block != expected_clamps:
+        raise TelemetrySealError(
+            "clamp flags do not describe the requested/effective admission"
         )
     return payload
 
@@ -143,39 +314,109 @@ def _resolve_max_bytes(explicit: int | None) -> int:
     )
 
 
-def verify_telemetry_seal(manifest_path: Path, policy_dir: Path) -> list[str]:
-    """Re-derive everything a seal claims, from the files still on disk.
+SEAL_MANIFEST_FIELDS = frozenset(
+    {
+        "schema_version",
+        "engine_id",
+        "model_id",
+        "sealed_at",
+        "server_instance_id",
+        "attestation_receipt_sha256",
+        "policy_application_sha256",
+        "first_scheduler_step",
+        "final_scheduler_step",
+        "record_count",
+        "generation_high_watermark",
+        "files",
+    }
+)
 
-    A seal that is only ever written is not evidence -- something has to be
-    able to detect that a certified segment, the acknowledgement, or the
-    receipt changed afterwards. Returns every discrepancy rather than
-    raising on the first, so one pass gives the complete diagnosis.
+
+def parse_telemetry_seal(payload: object) -> dict[str, Any]:
+    """Strictly validate a `telemetry_seal.json` manifest.
+
+    Exact field set: a manifest missing a field cannot be re-derived, and one
+    carrying an extra field was not produced by this writer.
     """
-    manifest_path = Path(manifest_path)
-    policy_dir = Path(policy_dir)
-    errors: list[str] = []
-    try:
-        manifest = json.loads(manifest_path.read_text())
-    except (OSError, json.JSONDecodeError) as error:
-        return [f"telemetry seal unreadable: {error}"]
-
-    if manifest.get("schema_version") != EXECUTION_EVIDENCE_SCHEMA_VERSION:
-        errors.append(
+    if not isinstance(payload, dict):
+        raise TelemetrySealError("telemetry seal must be a JSON object")
+    fields = set(payload)
+    if fields != set(SEAL_MANIFEST_FIELDS):
+        missing = sorted(SEAL_MANIFEST_FIELDS - fields)
+        unknown = sorted(fields - SEAL_MANIFEST_FIELDS)
+        raise TelemetrySealError(
+            f"telemetry seal fields mismatch: missing={missing}, unknown={unknown}"
+        )
+    if payload["schema_version"] != EXECUTION_EVIDENCE_SCHEMA_VERSION:
+        raise TelemetrySealError(
             "telemetry seal requires execution-evidence schema "
             f"{EXECUTION_EVIDENCE_SCHEMA_VERSION}"
         )
-    if not manifest.get("files"):
-        errors.append("telemetry seal certifies no segments")
-    if not manifest.get("record_count"):
-        errors.append("telemetry seal certifies no records")
+    for field in (
+        "engine_id",
+        "model_id",
+        "server_instance_id",
+        "attestation_receipt_sha256",
+        "policy_application_sha256",
+    ):
+        if not isinstance(payload[field], str) or not payload[field]:
+            raise TelemetrySealError(f"{field} must be a non-empty string")
+    for field in ("first_scheduler_step", "final_scheduler_step", "record_count"):
+        _seal_int(payload, field, minimum=1)
+    if payload["generation_high_watermark"] is not None:
+        _seal_int(payload, "generation_high_watermark", minimum=0)
+    try:
+        parse_iso8601(payload["sealed_at"])
+    except (TypeError, ValueError) as error:
+        raise TelemetrySealError(f"invalid sealed_at: {error}") from error
+    files = payload["files"]
+    if not isinstance(files, list) or not files:
+        raise TelemetrySealError("a seal must certify at least one segment")
+    for entry in files:
+        if not isinstance(entry, dict) or set(entry) != {"name", "size", "sha256"}:
+            raise TelemetrySealError(
+                "each certified file entry must be name/size/sha256"
+            )
+        if not isinstance(entry["name"], str) or not entry["name"]:
+            raise TelemetrySealError("certified file name must be a non-empty string")
+        _seal_int(entry, "size", minimum=0)
+        if not isinstance(entry["sha256"], str) or len(entry["sha256"]) != 64:
+            raise TelemetrySealError("certified file sha256 must be a sha256 digest")
+    return payload
 
+
+def verify_telemetry_seal(manifest_path: Path, policy_dir: Path) -> list[str]:
+    """Re-derive *everything* a seal claims, from the files still on disk.
+
+    A seal that is only ever written is not evidence. This recomputes the
+    instance identity, generation high-watermark, step bounds, record count,
+    monotonic step sequence, engine/model identity, and both sibling digests
+    -- and re-parses the siblings to confirm they describe the same instance.
+    A field the verifier does not re-derive is a field an attacker can edit
+    freely, which is exactly how the reviewed revision let a watermark of
+    `999` pass.
+
+    Returns every discrepancy rather than raising on the first, so one pass
+    gives the complete diagnosis.
+    """
+    manifest_path = Path(manifest_path)
+    policy_dir = Path(policy_dir)
+    try:
+        manifest = parse_telemetry_seal(json.loads(manifest_path.read_text()))
+    except (OSError, json.JSONDecodeError, TelemetrySealError) as error:
+        return [f"telemetry seal unusable: {error}"]
+
+    errors: list[str] = []
     seen_names: set[str] = set()
     observed_records = 0
     observed_first: int | None = None
     observed_last: int | None = None
-    instances: set[str] = set()
-    for entry in manifest.get("files", []):
-        name = entry.get("name")
+    observed_watermark: int | None = None
+    instances: set[str | None] = set()
+    identities: set[tuple[str, str]] = set()
+
+    for entry in manifest["files"]:
+        name = entry["name"]
         if name in seen_names:
             errors.append(f"telemetry seal lists {name} twice")
             continue
@@ -185,10 +426,10 @@ def verify_telemetry_seal(manifest_path: Path, policy_dir: Path) -> list[str]:
             errors.append(f"certified segment {name} is missing")
             continue
         payload = path.read_bytes()
-        if hashlib.sha256(payload).hexdigest() != entry.get("sha256"):
+        if hashlib.sha256(payload).hexdigest() != entry["sha256"]:
             errors.append(f"certified segment {name} changed after sealing")
             continue
-        if len(payload) != entry.get("size"):
+        if len(payload) != entry["size"]:
             errors.append(f"certified segment {name} has an unexpected size")
         for line_number, line in enumerate(payload.decode().splitlines(), start=1):
             if not line.strip():
@@ -206,38 +447,96 @@ def verify_telemetry_seal(manifest_path: Path, policy_dir: Path) -> list[str]:
             observed_first = step if observed_first is None else observed_first
             observed_last = step
             observed_records += 1
-            if record["server_instance_id"] is not None:
-                instances.add(record["server_instance_id"])
+            instances.add(record["server_instance_id"])
+            identities.add((record["engine_id"], record["model_id"]))
+            candidate = record["generation_high_watermark"]
+            if candidate is not None:
+                observed_watermark = (
+                    candidate
+                    if observed_watermark is None
+                    else max(observed_watermark, candidate)
+                )
 
-    if len(instances) > 1:
-        errors.append("certified telemetry mixes multiple server instances")
-    elif instances and manifest.get("server_instance_id") not in instances:
-        errors.append("telemetry seal names a different server instance")
-    if manifest.get("record_count") != observed_records:
+    # A null instance id is *not* filtered out here: an unattested record
+    # cannot certify anything, and discarding it (the reviewed behaviour)
+    # made an entirely unattested stream derive a null instance and pass.
+    if None in instances:
         errors.append(
-            f"telemetry seal claims {manifest.get('record_count')} records, "
+            "certified telemetry contains unattested records (server_instance_id "
+            "is null); a formal seal requires every record to name its instance"
+        )
+    attested = {value for value in instances if value is not None}
+    if len(attested) > 1:
+        errors.append("certified telemetry mixes multiple server instances")
+    elif attested and manifest["server_instance_id"] not in attested:
+        errors.append("telemetry seal names a different server instance")
+    if len(identities) > 1:
+        errors.append("certified telemetry mixes multiple engine/model identities")
+    elif identities and next(iter(identities)) != (
+        manifest["engine_id"],
+        manifest["model_id"],
+    ):
+        errors.append("telemetry seal names a different engine/model identity")
+
+    if manifest["record_count"] != observed_records:
+        errors.append(
+            f"telemetry seal claims {manifest['record_count']} records, "
             f"found {observed_records}"
         )
     for field, observed in (
         ("first_scheduler_step", observed_first),
         ("final_scheduler_step", observed_last),
+        ("generation_high_watermark", observed_watermark),
     ):
-        if manifest.get(field) != observed:
+        if manifest[field] != observed:
             errors.append(
-                f"telemetry seal {field} is {manifest.get(field)}, found {observed}"
+                f"telemetry seal {field} is {manifest[field]}, found {observed}"
             )
 
-    for field, filename in (
-        ("attestation_receipt_sha256", SERVER_START_RECEIPT_FILENAME),
-        ("policy_application_sha256", POLICY_APPLICATION_FILENAME),
+    errors.extend(_verify_sealed_siblings(manifest, policy_dir))
+    return errors
+
+
+def _verify_sealed_siblings(manifest: dict[str, Any], policy_dir: Path) -> list[str]:
+    """Re-hash *and re-parse* the receipt and acknowledgement.
+
+    Comparing digests alone would accept a sibling whose content was replaced
+    wholesale as long as the manifest digest was updated to match. Parsing
+    them and checking they name the sealed instance closes that.
+    """
+    from gladius_vllm.application import parse_policy_application_v2
+    from gladius_vllm.receipt import parse_server_start_receipt
+
+    errors: list[str] = []
+    for field, filename, parser, instance_of in (
+        (
+            "attestation_receipt_sha256",
+            SERVER_START_RECEIPT_FILENAME,
+            parse_server_start_receipt,
+            lambda value: value.server_instance_id,
+        ),
+        (
+            "policy_application_sha256",
+            POLICY_APPLICATION_FILENAME,
+            parse_policy_application_v2,
+            lambda value: value.server_instance_id,
+        ),
     ):
-        expected = manifest.get(field)
         path = policy_dir / filename
-        actual = (
-            hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
-        )
-        if expected != actual:
+        if not path.is_file():
+            errors.append(f"{filename} is missing; a formal seal requires it")
+            continue
+        payload = path.read_bytes()
+        if hashlib.sha256(payload).hexdigest() != manifest[field]:
             errors.append(f"{filename} changed after sealing")
+            continue
+        try:
+            parsed = parser(json.loads(payload))
+        except (json.JSONDecodeError, ValueError) as error:
+            errors.append(f"{filename} does not parse strictly: {error}")
+            continue
+        if instance_of(parsed) != manifest["server_instance_id"]:
+            errors.append(f"{filename} names a different server instance")
     return errors
 
 
@@ -261,7 +560,20 @@ class TelemetryWriter:
         self._rotation_count = 0
         self._last_write_ns = 0
         self._sealed = False
+        self._half_native_seen = False
         self._file = None
+        if self._path is not None and _is_retired(self._path.parent):
+            # A directory that already holds a published seal or retirement
+            # marker describes a *completed* formal attempt. Appending to it
+            # would destroy certified bytes before any verifier could notice,
+            # so this writer stays closed and serving continues without
+            # telemetry. A restarted server uses a new directory and nonce.
+            logger.warning(
+                "GLADIUS telemetry disabled: %s is a retired policy directory; "
+                "a new server instance must use a new directory",
+                self._path.parent,
+            )
+            self._path = None
         if self._path is not None:
             try:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -366,12 +678,28 @@ class TelemetryWriter:
                 ),
             }
 
-            # One source for all three identity fields, so the native
-            # invariant `(generation is None) == (policy_id is None) ==
-            # (decision_id is None)` cannot drift apart field by field.
-            native = decision.generation is None or decision.policy_id is None
-            generation = None if native else decision.generation
-            policy_id = None if native else decision.policy_id
+            # A half-native decision -- a generation with no policy id, or
+            # the reverse -- is an impossible scheduler state. Rewriting it
+            # into an all-null record (the previous behaviour) would publish
+            # it as valid native evidence and hide the defect. Instead the
+            # writer refuses to certify anything further for this instance,
+            # while serving continues untouched.
+            generation = decision.generation
+            policy_id = decision.policy_id
+            if (generation is None) != (policy_id is None):
+                self._half_native_seen = True
+                logger.warning(
+                    "GLADIUS telemetry disabled at step %d: the scheduler "
+                    "reported a half-native decision (generation=%r, "
+                    "policy_id=%r), which cannot be certified",
+                    self._step,
+                    generation,
+                    policy_id,
+                )
+                with contextlib.suppress(OSError):
+                    self._file.close()
+                self._file = None
+                return
 
             record = {
                 "schema_version": EXECUTION_EVIDENCE_SCHEMA_VERSION,
@@ -503,26 +831,63 @@ class TelemetryWriter:
                 "refusing to seal an empty telemetry stream: a formal attempt "
                 "needs at least one certified scheduler record"
             )
-        attested = {value for value in instances if value is not None}
-        if len(attested) > 1:
+        # An unattested record certifies nothing. Filtering nulls out before
+        # counting (the reviewed behaviour) let a stream in which *every*
+        # record was unattested derive a null instance and seal successfully.
+        if None in instances:
             raise TelemetrySealError(
-                f"telemetry mixes {len(attested)} server instances; a seal "
+                "refusing to seal unattested telemetry: every record must name "
+                "its server instance, which means the server-start receipt must "
+                "have been published before the certified window began"
+            )
+        if len(instances) > 1:
+            raise TelemetrySealError(
+                f"telemetry mixes {len(instances)} server instances; a seal "
                 "certifies exactly one serving process"
             )
         return {
-            "server_instance_id": next(iter(attested), None),
+            "server_instance_id": next(iter(instances)),
             "first_scheduler_step": first_step,
             "final_scheduler_step": last_step,
             "record_count": record_count,
             "generation_high_watermark": watermark,
         }
 
-    def _sibling_digest(self, filename: str) -> str | None:
+    def _sealed_sibling_digest(self, filename: str, *, instance_id: str) -> str:
+        """Hash a sibling only after it parses and names the sealed instance.
+
+        A digest taken before those checks certifies whatever bytes happened
+        to be there -- including a missing file, which the reviewed revision
+        recorded as a null digest and still called a successful seal.
+        """
+        from gladius_vllm.application import parse_policy_application_v2
+        from gladius_vllm.receipt import parse_server_start_receipt
+
         assert self._path is not None
         path = self._path.parent / filename
         if not path.is_file():
-            return None
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+            raise TelemetrySealError(
+                f"refusing to seal without {filename}: a formal seal binds both "
+                "the server-start receipt and the final acknowledgement"
+            )
+        payload = path.read_bytes()
+        parser = (
+            parse_server_start_receipt
+            if filename == SERVER_START_RECEIPT_FILENAME
+            else parse_policy_application_v2
+        )
+        try:
+            parsed = parser(json.loads(payload))
+        except (json.JSONDecodeError, ValueError) as error:
+            raise TelemetrySealError(
+                f"{filename} does not parse strictly: {error}"
+            ) from error
+        if parsed.server_instance_id != instance_id:
+            raise TelemetrySealError(
+                f"{filename} names server instance "
+                f"{parsed.server_instance_id!r}, not the sealed {instance_id!r}"
+            )
+        return hashlib.sha256(payload).hexdigest()
 
     def seal(self, manifest_path: Path) -> bool:
         """Close and atomically certify this writer's telemetry segments.
@@ -537,22 +902,30 @@ class TelemetryWriter:
         self.close()
         if self._path is None:
             return False
+        if self._half_native_seen:
+            logger.warning(
+                "GLADIUS refusing to seal %s: this instance emitted a "
+                "half-native decision and can no longer certify evidence",
+                self._path,
+            )
+            return False
         try:
             segments = self._ordered_segments()
             derived = self._verify_segments(segments)
+            instance_id = str(derived["server_instance_id"])
             manifest = {
                 "schema_version": EXECUTION_EVIDENCE_SCHEMA_VERSION,
                 "engine_id": self._engine_id,
                 "model_id": self._model_id,
                 "sealed_at": format_iso8601(),
-                "attestation_receipt_sha256": self._sibling_digest(
-                    SERVER_START_RECEIPT_FILENAME
+                "attestation_receipt_sha256": self._sealed_sibling_digest(
+                    SERVER_START_RECEIPT_FILENAME, instance_id=instance_id
                 ),
                 # Captured after the last scheduler step, so it binds the
                 # final observed application state rather than whichever one
                 # happened to be current when sealing began.
-                "policy_application_sha256": self._sibling_digest(
-                    POLICY_APPLICATION_FILENAME
+                "policy_application_sha256": self._sealed_sibling_digest(
+                    POLICY_APPLICATION_FILENAME, instance_id=instance_id
                 ),
                 "files": [
                     {
@@ -564,7 +937,11 @@ class TelemetryWriter:
                 ],
                 **derived,
             }
+            parse_telemetry_seal(manifest)
             atomic_write_json(manifest_path, manifest)
+            # The directory now holds certified evidence: no later writer may
+            # reopen it, even one in a freshly started server process.
+            retire_policy_directory(self._path.parent)
             return True
         except Exception:
             logger.warning(

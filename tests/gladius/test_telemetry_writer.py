@@ -403,19 +403,45 @@ def test_stats_construction_failure_is_fail_open_not_just_write_failure(tmp_path
 
 
 def test_seal_hashes_telemetry_and_blocks_later_mutation(tmp_path):
+    # A formal seal binds the receipt and the acknowledgement, so both have
+    # to be real and name the sealed instance. The shared cross-repository
+    # fixture supplies them.
+    from pathlib import Path
+
+    fixture = json.loads(
+        (
+            Path(__file__).parent / "fixtures" / "gladius-execution-evidence-v2.json"
+        ).read_text()
+    )
+    receipt = fixture["valid_server_start_receipt"]
+    instance_id = receipt["server_instance_id"]
+    (tmp_path / "server_start_receipt.json").write_text(json.dumps(receipt))
+    (tmp_path / "policy_application.json").write_text(
+        json.dumps(fixture["valid_applications"]["active"])
+    )
+
     path = tmp_path / "telemetry.jsonl"
     manifest_path = tmp_path / "telemetry_seal.json"
-    writer = TelemetryWriter(path=path, engine_id="e", model_id="m")
+    writer = TelemetryWriter(
+        path=path, engine_id=receipt["engine_id"], model_id=receipt["model_id"]
+    )
     scheduler = _fake_scheduler(requests={}, running=[], waiting=[], skipped_waiting=[])
     output = _fake_output(new_req_ids=[], scheduled_tokens={})
-    writer.record(scheduler, output, _decision())
+    writer.record(
+        scheduler,
+        output,
+        _decision(),
+        server_instance_id=instance_id,
+        generation_high_watermark=3,
+    )
     certified_bytes = path.read_bytes()
 
     assert writer.seal(manifest_path) is True
     manifest = json.loads(manifest_path.read_text())
     assert manifest["schema_version"] == "2.0.0"
-    assert manifest["engine_id"] == "e"
-    assert manifest["model_id"] == "m"
+    assert manifest["engine_id"] == receipt["engine_id"]
+    assert manifest["model_id"] == receipt["model_id"]
+    assert manifest["server_instance_id"] == instance_id
     assert manifest["first_scheduler_step"] == 1
     assert manifest["final_scheduler_step"] == 1
     assert manifest["record_count"] == 1

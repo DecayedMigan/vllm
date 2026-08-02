@@ -25,9 +25,11 @@ import time
 from pathlib import Path
 
 from gladius_vllm.receipt import (
+    DeploymentExpectation,
     ReceiptError,
     assemble_server_start_receipt,
     read_server_start_receipt,
+    verify_receipt_against_deployment,
     verify_server_start_receipt,
 )
 
@@ -131,16 +133,36 @@ def _build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--host", required=True)
         subparser.add_argument("--port", type=int, required=True)
         if name == "publish":
-            subparser.add_argument("--api-pid", type=int, default=None)
+            subparser.add_argument(
+                "--expect-api-pid",
+                type=int,
+                default=None,
+                help=(
+                    "cross-check only: the PID is always derived from the "
+                    "listening socket, and publication fails if this disagrees"
+                ),
+            )
             subparser.add_argument("--wait-seconds", type=float, default=300.0)
         else:
+            subparser.add_argument(
+                "--deployment-manifest",
+                type=Path,
+                default=None,
+                help=(
+                    "the immutable manifest of expected identity and digests; "
+                    "required by --formal"
+                ),
+            )
             subparser.add_argument("--expect-gpu-uuid", default=None)
             subparser.add_argument("--expect-engine-id", default=None)
             subparser.add_argument("--expect-model-id", default=None)
             subparser.add_argument(
                 "--formal",
                 action="store_true",
-                help="also require the frozen Qwen3-8B startup configuration",
+                help=(
+                    "require the frozen Qwen3-8B startup configuration and every "
+                    "deployment digest; needs --deployment-manifest"
+                ),
             )
     return parser
 
@@ -152,7 +174,16 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "publish":
             _wait_for_contribution(policy_dir, args.wait_seconds)
-            api_pid = args.api_pid or _listen_socket_owner_pid(args.host, args.port)
+            # Always derived from the bound socket, never accepted from the
+            # caller. A supplied PID that was used directly (the reviewed
+            # behaviour) could bind a live but unrelated process to the
+            # endpoint the campaign will actually call.
+            api_pid = _listen_socket_owner_pid(args.host, args.port)
+            if args.expect_api_pid is not None and args.expect_api_pid != api_pid:
+                raise ReceiptError(
+                    f"{args.host}:{args.port} is owned by PID {api_pid}, not the "
+                    f"expected {args.expect_api_pid}"
+                )
             receipt = assemble_server_start_receipt(
                 policy_dir,
                 api_pid=api_pid,
@@ -177,16 +208,35 @@ def main(argv: list[str] | None = None) -> int:
             return _EXIT_OK
 
         receipt = read_server_start_receipt(policy_dir / "server_start_receipt.json")
-        errors = verify_server_start_receipt(
-            receipt,
-            expected_nonce=args.nonce,
-            expected_engine_id=args.expect_engine_id,
-            expected_model_id=args.expect_model_id,
-            expected_listen_host=args.host,
-            expected_listen_port=args.port,
-            expected_gpu_uuid=args.expect_gpu_uuid,
-            require_formal_startup=args.formal,
-        )
+        if args.formal:
+            if args.deployment_manifest is None:
+                raise ReceiptError(
+                    "--formal requires --deployment-manifest: formal verification "
+                    "checks every deployment digest, and a missing expectation is "
+                    "a failure rather than a skipped check"
+                )
+            expectation = DeploymentExpectation.from_file(args.deployment_manifest)
+            for name, supplied, expected in (
+                ("nonce", args.nonce, expectation.attestation_nonce),
+                ("host", args.host, expectation.listen_host),
+                ("port", args.port, expectation.listen_port),
+            ):
+                if supplied != expected:
+                    raise ReceiptError(
+                        f"--{name} {supplied!r} disagrees with the deployment "
+                        f"manifest's {expected!r}"
+                    )
+            errors = verify_receipt_against_deployment(receipt, expectation)
+        else:
+            errors = verify_server_start_receipt(
+                receipt,
+                expected_nonce=args.nonce,
+                expected_engine_id=args.expect_engine_id,
+                expected_model_id=args.expect_model_id,
+                expected_listen_host=args.host,
+                expected_listen_port=args.port,
+                expected_gpu_uuid=args.expect_gpu_uuid,
+            )
     except ReceiptError as error:
         print(f"attestation failed: {error}", file=sys.stderr)
         return _EXIT_INVALID
