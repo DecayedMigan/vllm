@@ -1,0 +1,17 @@
+Four real lanes from the four-process smoke, fed to SMIG's validate_lane_set.
+Every receipt below was written by a launched vLLM server and parses
+strictly, including the re-derived server_instance_id.
+
+distinct instances:   4
+distinct api pids:    4
+distinct engine pids: 4
+distinct ports:       4
+distinct gpu uuids:   1 (one card)
+
+RESULT: REFUSED, as it must be on a single-GPU host.
+  two or more lanes share the same physical GPU (['31656562-6237-6232-3063-353163396232']); each GPU needs its own server process, port, and policy directory
+
+This is the four-distinct-physical-GPU requirement working on real
+evidence. It is also precisely why this host cannot stand in for the
+H100 campaign: the check that would pass there is the check that
+fails here.

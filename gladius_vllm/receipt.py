@@ -29,6 +29,7 @@ itself.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -828,19 +829,27 @@ def _resolve_physical_gpu() -> PhysicalGpuIdentity:
     """
     pci_bus_id, cuda_uuid, cuda_name = _probe_cuda_device()
 
+    # The import succeeds on ROCm -- `vllm.third_party.pynvml` is vendored --
+    # and `nvmlInit()` is what actually fails there, so guarding only the
+    # import leaves NVMLError_LibraryNotFound to escape and take startup
+    # attestation down with it. A four-process run on a ROCm host found this.
+    nvml = None
     try:
         from vllm.third_party import pynvml
-    except Exception:  # noqa: BLE001 - NVML is absent on ROCm/CPU hosts
-        pynvml = None
 
-    if pynvml is not None:
         pynvml.nvmlInit()
+        nvml = pynvml
+    except Exception:  # noqa: BLE001 - NVML is absent on ROCm/CPU hosts
+        logger.debug("GLADIUS: NVML unavailable on this host", exc_info=True)
+
+    if nvml is not None:
         try:
             return resolve_physical_gpu_identity(
-                nvml=pynvml, pci_bus_id=pci_bus_id, cuda_uuid=cuda_uuid
+                nvml=nvml, pci_bus_id=pci_bus_id, cuda_uuid=cuda_uuid
             )
         finally:
-            pynvml.nvmlShutdown()
+            with contextlib.suppress(Exception):
+                nvml.nvmlShutdown()
 
     # ROCm development hosts have no NVML at all, so corroboration is
     # impossible rather than merely skipped. The identity is still measured

@@ -1,0 +1,8 @@
+{
+  "api_pid": 394776,
+  "engine_core_pid": 394854,
+  "engine_id": "gladius-smoke-gpu2",
+  "model_id": "gladius-smoke",
+  "physical_gpu_uuid": "31656562-6237-6232-3063-353163396232",
+  "server_instance_id": "srv-362f4f285a58a3f281d3b7c9d11bd063"
+}

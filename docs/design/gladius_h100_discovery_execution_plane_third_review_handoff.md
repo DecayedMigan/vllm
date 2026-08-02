@@ -82,19 +82,61 @@ python -m ruff format --check gladius_vllm tests/gladius                  # clea
 `263 passed`, **0 failed, 0 skipped** in `tests/gladius`. The paired-corpus
 test skips unless `GLADIUS_SMIG_ROOT` is set; the 263 figure is with it set.
 
-## 4. Four-process launched-server smoke
+## 4. Four-process launched-server smoke — results
 
-`scripts/four_process_execution_plane_smoke.sh` launches four real
-`vllm.entrypoints.openai.api_server` processes with four policy directories,
-four nonces, and four ports, then drives the seal lifecycle through them.
+`scripts/four_process_execution_plane_smoke.sh` launched four real
+`vllm.entrypoints.openai.api_server` processes (Qwen3-0.6B, four policy
+directories, four nonces, ports 8410–8413) on one AMD RX 7900 XTX and drove
+the seal lifecycle through them. Retained under
+`docs/superpowers/artifacts/third-review/four-process-smoke/`.
 
-Retained under `docs/superpowers/artifacts/third-review/four-process-smoke/`.
+Measured, per lane, from real processes:
 
-What it establishes on real processes rather than mocks: four distinct
-`server_instance_id`s derived from real `/proc` process pairs, per-lane
-listen-socket ownership read from `/proc/net/tcp`, `api_pid !=
-engine_core_pid`, and the seal + `RETIRED` + acknowledgement produced by the
-live scheduler with this script only writing the request file.
+| lane | instance | api/engine pid | socket owner | seal by server | RETIRED | ack |
+|---|---|---|---|---|---|---|
+| 0 | `srv-6629fb5f…` | 394306 / 394381 | 394306 ✓ | **yes** | yes | `sealed` |
+| 1 | `srv-2cab5f11…` | 394536 / 394615 | 394536 ✓ | **yes** | yes | `sealed` |
+| 2 | `srv-362f4f28…` | 394776 / 394854 | 394776 ✓ | **yes** | yes | `sealed` |
+| 3 | `srv-d844313a…` | 395006 / 395091 | 395006 ✓ | **yes** | yes | `sealed` |
+
+Cross-lane: 4 distinct instances, 4 distinct API PIDs, 4 distinct EngineCore
+PIDs, 4 distinct ports, **1** physical GPU UUID. Every lane served a real
+completion (8 tokens, ~0.12 s).
+
+**E1 is satisfied on real hardware.** The driver writes only
+`seal_request.json`; the seal, the `RETIRED` marker, and the acknowledgement
+were all produced by the live scheduler inside each serving process. This is
+the property the third review found had no production caller at all.
+
+**The seal's own semantics verified cleanly.** The only errors
+`verify_telemetry_seal` reported are `SEAL_RECEIPT_EXPECTATION_MISMATCH` —
+this host is not the frozen Qwen3-8B configuration. No
+`SEAL_SEGMENT_SET_MISMATCH`, `SEAL_BOUNDS_MISMATCH`,
+`SEAL_INSTANCE_MISMATCH`, or `SEAL_APPLICATION_*` error appeared, so the
+segment set, derived bounds, instance binding, and acknowledgement-to-step
+binding all held against evidence a real server wrote.
+
+### Two things the run found that no test had
+
+1. **A real bug in this delivery.** `_resolve_physical_gpu` guarded only the
+   `pynvml` *import*. On ROCm the import succeeds — vLLM vendors the module —
+   and `nvmlInit()` is what raises, so `NVMLError_LibraryNotFound` escaped
+   and took startup attestation down silently. Every lane failed to publish
+   a contribution until this was fixed. No CPU test would have caught it,
+   because a CPU test has no `vllm.third_party.pynvml` to import
+   successfully.
+2. **`validate_lane_set` refuses these four lanes** —
+   `lane-set-probe.txt`, run against the four real receipts:
+
+   ```
+   RESULT: REFUSED, as it must be on a single-GPU host.
+     two or more lanes share the same physical GPU
+     (['31656562-6237-6232-3063-353163396232'])
+   ```
+
+   Recorded as a positive result: the four-distinct-physical-GPU requirement
+   works on real evidence, and it is exactly why this host cannot stand in
+   for the H100 campaign.
 
 ## 5. What this delivery does **not** establish
 

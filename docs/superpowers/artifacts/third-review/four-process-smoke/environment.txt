@@ -1,8 +1,9 @@
 # Four-process execution-plane smoke
 
-started:  2026-08-02T11:19:03-07:00
-model:    /home/zazzi/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
+started:  2026-08-02T11:40:23-07:00
+model:    /home/zazzi/models/Qwen3-0.6B
 vllm:     0.1.dev1+gec0a31d4a.d20260606
-commit:   2b91fc2b2e4fcfe1361b0ea3129612f5baffb4ed
+commit:   d99c185f8acc57bb997457b13a1dc5d6b435c4d6
 gpu:      card0,AMD Radeon RX 7900 XTX,0x744c,Advanced Micro Devices Inc. [AMD/ATI],31XFSHBS1,0x7901,0xc8,1,33510,gfx1100
 
+finished: 2026-08-02T11:41:40-07:00

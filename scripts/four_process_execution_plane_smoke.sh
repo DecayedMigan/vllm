@@ -49,6 +49,12 @@ trap cleanup EXIT
 } | tee "$ARTIFACTS/environment.txt"
 
 # --- launch -------------------------------------------------------------
+#
+# Sequentially, each lane waiting until the previous one is serving.
+# `gpu_memory_utilization` is a fraction of the *whole card* that each
+# process reserves for itself, so four lanes need 4 x MEM_UTIL <= ~0.95 and
+# launching them at once makes every one profile against the others'
+# in-flight allocations and conclude there is no room for a KV cache.
 for lane in $(seq 0 $((LANES - 1))); do
   port=$((BASE_PORT + lane))
   policy_dir="$RUN_DIR/policy$lane"
@@ -69,27 +75,29 @@ for lane in $(seq 0 $((LANES - 1))); do
       --port "$port" \
       --host 127.0.0.1 \
       --gpu-memory-utilization "$MEM_UTIL" \
-      --max-model-len 2048 \
-      --max-num-seqs 8 \
+      --max-model-len 1024 \
+      --max-num-seqs 4 \
+      --enforce-eager \
       --scheduler-cls gladius_vllm.scheduler.GladiusScheduler \
       > "$RUN_DIR/server$lane.log" 2>&1 &
   PIDS+=($!)
-  echo "lane $lane: launched pid ${PIDS[-1]} on port $port"
-done
+  echo "lane $lane: launched pid ${PIDS[-1]} on port $port (util $MEM_UTIL)"
 
-# --- wait for readiness --------------------------------------------------
-for lane in $(seq 0 $((LANES - 1))); do
-  port=$((BASE_PORT + lane))
-  for _ in $(seq 1 180); do
+  for _ in $(seq 1 150); do
     if curl -sf "http://127.0.0.1:$port/health" > /dev/null 2>&1; then
-      echo "lane $lane: healthy"
+      echo "lane $lane: serving"
       break
+    fi
+    if ! kill -0 "${PIDS[-1]}" 2>/dev/null; then
+      echo "lane $lane died during startup; last log lines:" >&2
+      tail -25 "$RUN_DIR/server$lane.log" >&2
+      exit 1
     fi
     sleep 2
   done
   curl -sf "http://127.0.0.1:$port/health" > /dev/null 2>&1 || {
-    echo "lane $lane never became healthy; last log lines:" >&2
-    tail -30 "$RUN_DIR/server$lane.log" >&2
+    echo "lane $lane never became healthy" >&2
+    tail -25 "$RUN_DIR/server$lane.log" >&2
     exit 1
   }
 done
