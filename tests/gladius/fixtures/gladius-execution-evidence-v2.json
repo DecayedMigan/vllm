@@ -1,0 +1,458 @@
+{
+  "contract_version": "2.0.0",
+  "description": "Shared GLADIUS execution-evidence fixtures. Committed byte-identical in the vLLM fork (tests/gladius/fixtures/) and in SMIG (tests/fixtures/). Both repositories report its SHA-256 in their handoff so a reviewer can confirm the two sides agree on the contract they were tested against.",
+  "invalid_cases": {
+    "clamped_active_application": {
+      "clamped": {
+        "max_num_batched_tokens": false,
+        "max_num_seqs": true
+      },
+      "decision_id": "policy-42",
+      "effective_admission": {
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 4
+      },
+      "engine_id": "gladius-h100-gpu0",
+      "generation": 42,
+      "generation_high_watermark": 42,
+      "model_id": "/models/Qwen3-8B",
+      "observed_at": "2026-08-02T09:05:00Z",
+      "policy_id": "policy-42",
+      "requested_admission": {
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 8
+      },
+      "scheduler_step": 901,
+      "schema_version": "2.0.0",
+      "server_instance_id": "srv-b98904472fa1ba70b59582d9d249925b",
+      "state": "active"
+    },
+    "cross_instance_telemetry": {
+      "clamped": {
+        "max_num_batched_tokens": false,
+        "max_num_seqs": false
+      },
+      "created_at": "2026-08-02T09:05:00Z",
+      "decision_id": "policy-42",
+      "effective_admission": {
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 8
+      },
+      "engine_id": "gladius-h100-gpu0",
+      "expires_at": null,
+      "generation": 42,
+      "generation_high_watermark": 42,
+      "kv_cache_usage": 0.73,
+      "model_id": "/models/Qwen3-8B",
+      "num_decode_reqs": 3,
+      "num_prefill_reqs": 1,
+      "num_running_reqs": 8,
+      "num_scheduled_reqs": 4,
+      "num_scheduled_tokens": 512,
+      "num_skipped_waiting_reqs": 0,
+      "num_waiting_reqs": 17,
+      "policy_apply_ns": 900,
+      "policy_id": "policy-42",
+      "policy_poll_ns": 1100,
+      "policy_source": "file",
+      "policy_status": "active",
+      "requested_admission": {
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 8
+      },
+      "schema_version": "2.0.0",
+      "server_instance_id": "srv-40c55870b15263bf31864a1f3e1087d6",
+      "step": 901,
+      "telemetry_write_ns": 17000,
+      "window_id": null
+    },
+    "empty_telemetry_seal": {
+      "attestation_receipt_sha256": "3cb4316fb319c3b9b6fcfda65dfac2ab1baf8128ee50bd6ccd767292855db8df",
+      "engine_id": "gladius-h100-gpu0",
+      "files": [],
+      "final_scheduler_step": null,
+      "first_scheduler_step": null,
+      "generation_high_watermark": 42,
+      "model_id": "/models/Qwen3-8B",
+      "policy_application_sha256": "6d052f80597c4e7c8e284b593e3c64d9a2b6d43a371f570e7b5df94e21f328a0",
+      "record_count": 0,
+      "schema_version": "2.0.0",
+      "sealed_at": "2026-08-02T11:00:00Z",
+      "server_instance_id": "srv-b98904472fa1ba70b59582d9d249925b"
+    },
+    "half_native_application": {
+      "clamped": {
+        "max_num_batched_tokens": false,
+        "max_num_seqs": false
+      },
+      "decision_id": null,
+      "effective_admission": {
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 8
+      },
+      "engine_id": "gladius-h100-gpu0",
+      "generation": 42,
+      "generation_high_watermark": 42,
+      "model_id": "/models/Qwen3-8B",
+      "observed_at": "2026-08-02T09:05:00Z",
+      "policy_id": null,
+      "requested_admission": {
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 8
+      },
+      "scheduler_step": 901,
+      "schema_version": "2.0.0",
+      "server_instance_id": "srv-b98904472fa1ba70b59582d9d249925b",
+      "state": "active"
+    },
+    "half_native_telemetry": {
+      "clamped": {
+        "max_num_batched_tokens": false,
+        "max_num_seqs": false
+      },
+      "created_at": "2026-08-02T09:05:00Z",
+      "decision_id": "policy-42",
+      "effective_admission": {
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 8
+      },
+      "engine_id": "gladius-h100-gpu0",
+      "expires_at": null,
+      "generation": null,
+      "generation_high_watermark": 42,
+      "kv_cache_usage": 0.73,
+      "model_id": "/models/Qwen3-8B",
+      "num_decode_reqs": 3,
+      "num_prefill_reqs": 1,
+      "num_running_reqs": 8,
+      "num_scheduled_reqs": 4,
+      "num_scheduled_tokens": 512,
+      "num_skipped_waiting_reqs": 0,
+      "num_waiting_reqs": 17,
+      "policy_apply_ns": 900,
+      "policy_id": "policy-42",
+      "policy_poll_ns": 1100,
+      "policy_source": "file",
+      "policy_status": "active",
+      "requested_admission": {
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 8
+      },
+      "schema_version": "2.0.0",
+      "server_instance_id": "srv-b98904472fa1ba70b59582d9d249925b",
+      "step": 901,
+      "telemetry_write_ns": 17000,
+      "window_id": null
+    },
+    "receipt_mismatch_application": {
+      "clamped": {
+        "max_num_batched_tokens": false,
+        "max_num_seqs": false
+      },
+      "decision_id": "policy-42",
+      "effective_admission": {
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 8
+      },
+      "engine_id": "gladius-h100-gpu0",
+      "generation": 42,
+      "generation_high_watermark": 42,
+      "model_id": "/models/Qwen3-8B",
+      "observed_at": "2026-08-02T09:05:00Z",
+      "policy_id": "policy-42",
+      "requested_admission": {
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 8
+      },
+      "scheduler_step": 901,
+      "schema_version": "2.0.0",
+      "server_instance_id": "srv-40c55870b15263bf31864a1f3e1087d6",
+      "state": "active"
+    },
+    "regressed_generation_application": {
+      "clamped": {
+        "max_num_batched_tokens": false,
+        "max_num_seqs": false
+      },
+      "decision_id": "policy-42",
+      "effective_admission": {
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 8
+      },
+      "engine_id": "gladius-h100-gpu0",
+      "generation": 41,
+      "generation_high_watermark": 40,
+      "model_id": "/models/Qwen3-8B",
+      "observed_at": "2026-08-02T09:05:00Z",
+      "policy_id": "policy-42",
+      "requested_admission": {
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 8
+      },
+      "scheduler_step": 901,
+      "schema_version": "2.0.0",
+      "server_instance_id": "srv-b98904472fa1ba70b59582d9d249925b",
+      "state": "active"
+    },
+    "schema_1x_application": {
+      "clamped": {
+        "max_num_batched_tokens": false,
+        "max_num_seqs": false
+      },
+      "decision_id": "policy-42",
+      "effective_admission": {
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 8
+      },
+      "engine_id": "gladius-h100-gpu0",
+      "generation": 42,
+      "model_id": "/models/Qwen3-8B",
+      "observed_at": "2026-08-02T09:05:00Z",
+      "policy_id": "policy-42",
+      "requested_admission": {
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 8
+      },
+      "scheduler_step": 901,
+      "schema_version": "1.0.0",
+      "state": "active"
+    },
+    "unattested_application": {
+      "clamped": {
+        "max_num_batched_tokens": false,
+        "max_num_seqs": false
+      },
+      "decision_id": "policy-42",
+      "effective_admission": {
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 8
+      },
+      "engine_id": "gladius-h100-gpu0",
+      "generation": 42,
+      "generation_high_watermark": 42,
+      "model_id": "/models/Qwen3-8B",
+      "observed_at": "2026-08-02T09:05:00Z",
+      "policy_id": "policy-42",
+      "requested_admission": {
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 8
+      },
+      "scheduler_step": 901,
+      "schema_version": "2.0.0",
+      "server_instance_id": null,
+      "state": "active"
+    }
+  },
+  "valid_applications": {
+    "active": {
+      "clamped": {
+        "max_num_batched_tokens": false,
+        "max_num_seqs": false
+      },
+      "decision_id": "policy-42",
+      "effective_admission": {
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 8
+      },
+      "engine_id": "gladius-h100-gpu0",
+      "generation": 42,
+      "generation_high_watermark": 42,
+      "model_id": "/models/Qwen3-8B",
+      "observed_at": "2026-08-02T09:05:00Z",
+      "policy_id": "policy-42",
+      "requested_admission": {
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 8
+      },
+      "scheduler_step": 901,
+      "schema_version": "2.0.0",
+      "server_instance_id": "srv-b98904472fa1ba70b59582d9d249925b",
+      "state": "active"
+    },
+    "attriting": {
+      "clamped": {
+        "max_num_batched_tokens": false,
+        "max_num_seqs": true
+      },
+      "decision_id": "policy-42",
+      "effective_admission": {
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 12
+      },
+      "engine_id": "gladius-h100-gpu0",
+      "generation": 42,
+      "generation_high_watermark": 42,
+      "model_id": "/models/Qwen3-8B",
+      "observed_at": "2026-08-02T09:05:00Z",
+      "policy_id": "policy-42",
+      "requested_admission": {
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 8
+      },
+      "scheduler_step": 880,
+      "schema_version": "2.0.0",
+      "server_instance_id": "srv-b98904472fa1ba70b59582d9d249925b",
+      "state": "attriting"
+    },
+    "fallback_native": {
+      "clamped": {
+        "max_num_batched_tokens": false,
+        "max_num_seqs": false
+      },
+      "decision_id": null,
+      "effective_admission": {
+        "max_num_batched_tokens": 8192,
+        "max_num_seqs": 32
+      },
+      "engine_id": "gladius-h100-gpu0",
+      "generation": null,
+      "generation_high_watermark": 42,
+      "model_id": "/models/Qwen3-8B",
+      "observed_at": "2026-08-02T09:05:00Z",
+      "policy_id": null,
+      "requested_admission": {
+        "max_num_batched_tokens": 8192,
+        "max_num_seqs": 32
+      },
+      "scheduler_step": 1204,
+      "schema_version": "2.0.0",
+      "server_instance_id": "srv-b98904472fa1ba70b59582d9d249925b",
+      "state": "fallback"
+    }
+  },
+  "valid_server_start_receipt": {
+    "api_pid": 41001,
+    "api_process_start_identity": "5f4b1c2d-6a7e-48f9-9b0c-1d2e3f405162:98213",
+    "attestation_nonce": "0f0d5f19b8a34e2a9c5d7e1f2b3a4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d",
+    "chunked_prefill_enabled": true,
+    "created_at": "2026-08-02T09:00:00Z",
+    "cuda_graph_mode": "FULL_AND_PIECEWISE",
+    "cuda_visible_devices": "0",
+    "enforce_eager": false,
+    "engine_core_pid": 41007,
+    "engine_core_process_start_identity": "5f4b1c2d-6a7e-48f9-9b0c-1d2e3f405162:98577",
+    "engine_id": "gladius-h100-gpu0",
+    "gladius_overlay_path": "/opt/gladius/gladius_vllm",
+    "gladius_overlay_tree_sha256": "2308708adadc0ac7d3e1d76165b9400bf838de16499f5252a32fba6dcde82fa0",
+    "gpu_memory_utilization": 0.75,
+    "listen_host": "127.0.0.1",
+    "listen_port": 8000,
+    "model_id": "/models/Qwen3-8B",
+    "model_path": "/models/Qwen3-8B",
+    "model_tree_sha256": "b075962b5e2d09eabfa8d8aa61037fdbf5c1cb9502f1a3858d624d6b11303a26",
+    "physical_gpu_name": "NVIDIA H100 80GB HBM3",
+    "physical_gpu_uuid": "GPU-0f9a1b2c-3d4e-5f60-7182-93a4b5c6d7e8",
+    "prefix_caching_enabled": true,
+    "schema_version": "2.0.0",
+    "server_instance_id": "srv-b98904472fa1ba70b59582d9d249925b",
+    "startup_max_model_len": 8192,
+    "startup_max_num_batched_tokens": 8192,
+    "startup_max_num_seqs": 32,
+    "tokenizer_tree_sha256": "f288d8696abd95725ccb55438530674f85c5e3447105f6313a3295734ca22fda",
+    "tree_hash_algorithm_version": "gladius-tree-sha256-v1",
+    "vllm_module_path": "/opt/venv/lib/python3.12/site-packages/vllm",
+    "vllm_native_binary_sha256": "7edd656a20b4a3bbb64f8db491db6fb1b48abbfa9505230fbd16d0940da023f1",
+    "vllm_package_tree_sha256": "3f69bff7d9ef054612b5a889b0f3dab2c845a94ff60ac7a5c840d856d7f1f258",
+    "vllm_version": "0.25.1"
+  },
+  "valid_telemetry": {
+    "file_backed": {
+      "clamped": {
+        "max_num_batched_tokens": false,
+        "max_num_seqs": false
+      },
+      "created_at": "2026-08-02T09:05:00Z",
+      "decision_id": "policy-42",
+      "effective_admission": {
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 8
+      },
+      "engine_id": "gladius-h100-gpu0",
+      "expires_at": null,
+      "generation": 42,
+      "generation_high_watermark": 42,
+      "kv_cache_usage": 0.73,
+      "model_id": "/models/Qwen3-8B",
+      "num_decode_reqs": 3,
+      "num_prefill_reqs": 1,
+      "num_running_reqs": 8,
+      "num_scheduled_reqs": 4,
+      "num_scheduled_tokens": 512,
+      "num_skipped_waiting_reqs": 0,
+      "num_waiting_reqs": 17,
+      "policy_apply_ns": 900,
+      "policy_id": "policy-42",
+      "policy_poll_ns": 1100,
+      "policy_source": "file",
+      "policy_status": "active",
+      "requested_admission": {
+        "max_num_batched_tokens": 2048,
+        "max_num_seqs": 8
+      },
+      "schema_version": "2.0.0",
+      "server_instance_id": "srv-b98904472fa1ba70b59582d9d249925b",
+      "step": 901,
+      "telemetry_write_ns": 17000,
+      "window_id": null
+    },
+    "native": {
+      "clamped": {
+        "max_num_batched_tokens": false,
+        "max_num_seqs": false
+      },
+      "created_at": "2026-08-02T09:05:00Z",
+      "decision_id": null,
+      "effective_admission": {
+        "max_num_batched_tokens": 8192,
+        "max_num_seqs": 32
+      },
+      "engine_id": "gladius-h100-gpu0",
+      "expires_at": null,
+      "generation": null,
+      "generation_high_watermark": null,
+      "kv_cache_usage": 0.73,
+      "model_id": "/models/Qwen3-8B",
+      "num_decode_reqs": 3,
+      "num_prefill_reqs": 1,
+      "num_running_reqs": 8,
+      "num_scheduled_reqs": 4,
+      "num_scheduled_tokens": 512,
+      "num_skipped_waiting_reqs": 0,
+      "num_waiting_reqs": 17,
+      "policy_apply_ns": 900,
+      "policy_id": null,
+      "policy_poll_ns": 1100,
+      "policy_source": "default",
+      "policy_status": "no_policy",
+      "requested_admission": {
+        "max_num_batched_tokens": 8192,
+        "max_num_seqs": 32
+      },
+      "schema_version": "2.0.0",
+      "server_instance_id": "srv-b98904472fa1ba70b59582d9d249925b",
+      "step": 1,
+      "telemetry_write_ns": 17000,
+      "window_id": null
+    }
+  },
+  "valid_telemetry_seal": {
+    "attestation_receipt_sha256": "3cb4316fb319c3b9b6fcfda65dfac2ab1baf8128ee50bd6ccd767292855db8df",
+    "engine_id": "gladius-h100-gpu0",
+    "files": [
+      {
+        "name": "telemetry.jsonl",
+        "sha256": "2f44e76fe54af4fc12aebf716fce65c42ccdc6d62026d6ff032f716d24ec8293",
+        "size": 412903
+      }
+    ],
+    "final_scheduler_step": 901,
+    "first_scheduler_step": 1,
+    "generation_high_watermark": 42,
+    "model_id": "/models/Qwen3-8B",
+    "policy_application_sha256": "6d052f80597c4e7c8e284b593e3c64d9a2b6d43a371f570e7b5df94e21f328a0",
+    "record_count": 901,
+    "schema_version": "2.0.0",
+    "sealed_at": "2026-08-02T11:00:00Z",
+    "server_instance_id": "srv-b98904472fa1ba70b59582d9d249925b"
+  }
+}

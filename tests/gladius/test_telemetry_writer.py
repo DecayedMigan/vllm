@@ -13,6 +13,8 @@ from gladius_vllm.telemetry import TelemetryWriter
 
 EXPECTED_FIELDS = {
     "schema_version",
+    "server_instance_id",
+    "generation_high_watermark",
     "generation",
     "policy_id",
     "decision_id",
@@ -411,10 +413,12 @@ def test_seal_hashes_telemetry_and_blocks_later_mutation(tmp_path):
 
     assert writer.seal(manifest_path) is True
     manifest = json.loads(manifest_path.read_text())
-    assert manifest["schema_version"] == "1.0.0"
+    assert manifest["schema_version"] == "2.0.0"
     assert manifest["engine_id"] == "e"
     assert manifest["model_id"] == "m"
+    assert manifest["first_scheduler_step"] == 1
     assert manifest["final_scheduler_step"] == 1
+    assert manifest["record_count"] == 1
     assert [item["name"] for item in manifest["files"]] == ["telemetry.jsonl"]
     assert len(manifest["files"][0]["sha256"]) == 64
 

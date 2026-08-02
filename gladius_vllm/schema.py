@@ -18,6 +18,15 @@ if TYPE_CHECKING:
 SCHEMA_VERSION = "1.0.0"
 SUPPORTED_SCHEMA_MAJOR = SCHEMA_VERSION.split(".")[0]
 
+# `policy_snapshot.json` stays on schema 1.0.0 -- the control direction did
+# not change. The *evidence* direction (server-start receipt, policy
+# application, telemetry, telemetry seal) moves to 2.0.0, because every one
+# of those documents now carries `server_instance_id` and must never be
+# confused with a 1.x artifact that cannot prove which serving process
+# produced it. The 1.x parsers stay in place and are deliberately kept
+# separate: a 1.x document must never satisfy a 2.0.0 requirement.
+EXECUTION_EVIDENCE_SCHEMA_VERSION = "2.0.0"
+
 DEFAULT_POLICY_POLL_INTERVAL_MS = 50
 DEFAULT_TELEMETRY_SAMPLE_N = 1
 DEFAULT_TELEMETRY_MAX_BYTES = 64 * 1024 * 1024  # 64 MiB

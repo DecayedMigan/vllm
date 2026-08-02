@@ -206,9 +206,7 @@ def test_schedule_publishes_matching_policy_application(tmp_path, monkeypatch):
         "max_num_seqs": 4,
         "max_num_batched_tokens": 2048,
     }
-    assert application["effective_admission"] == application[
-        "requested_admission"
-    ]
+    assert application["effective_admission"] == application["requested_admission"]
 
 
 def test_policy_above_startup_ceiling_is_clamped_not_applied(tmp_path, monkeypatch):
@@ -424,3 +422,23 @@ def test_schedule_clamp_and_telemetry_run_exactly_once_per_call_shape(
     assert gladius._telemetry_writer._step == 1
     gladius.schedule(True)
     assert gladius._telemetry_writer._step == 2
+
+    # Every execution-evidence 2.0.0 field appears exactly once per sampled
+    # step under both call shapes -- a field emitted only on the zero-arg
+    # path would silently disappear on whichever vLLM version passes
+    # `throttle_prefills`.
+    import json
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "telemetry.jsonl").read_text().splitlines()
+    ]
+    assert len(records) == 2
+    for record in records:
+        assert record["schema_version"] == "2.0.0"
+        assert "server_instance_id" in record
+        assert "generation_high_watermark" in record
+        # Unattested here (no receipt was assembled), stated honestly
+        # rather than guessed.
+        assert record["server_instance_id"] is None
+    assert [record["step"] for record in records] == [1, 2]

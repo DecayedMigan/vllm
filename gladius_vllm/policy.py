@@ -242,6 +242,14 @@ class PolicyLoader:
         self._last_stat: tuple[int, int, int] | None = None  # (mtime_ns, size, inode)
         self._last_poll_monotonic: float | None = None
         self._last_accepted_generation: int | None = None
+        # The greatest generation this loader has *ever* accepted. Expiry, a
+        # corrupt write, an engine mismatch, a regressed generation, and a
+        # fallback to startup admission all leave it untouched -- it records
+        # what this scheduler will now reject, which is exactly what a
+        # reconnecting client needs in order to choose a safe next
+        # generation. It is per-loader, i.e. per serving process, so it
+        # resets only when the server instance itself changes.
+        self._generation_high_watermark: int | None = None
         self._last_accepted_policy_id: str | None = None
         self._last_accepted_expires_at: datetime | None = None
         self._last_accepted_max_num_seqs: int | None = None
@@ -249,6 +257,15 @@ class PolicyLoader:
         self._last_decision: PolicyDecision = _default_decision(
             startup_max_num_seqs, startup_max_num_batched_tokens, "no_policy"
         )
+
+    @property
+    def generation_high_watermark(self) -> int | None:
+        """Greatest generation ever accepted by this serving process.
+
+        `None` means no file-backed policy has ever been accepted, so any
+        non-negative generation is still available.
+        """
+        return self._generation_high_watermark
 
     def poll(self) -> PolicyDecision:
         if self._snapshot_path is None:
@@ -315,6 +332,11 @@ class PolicyLoader:
             return self._reject_keep_last_or_default("rejected_regression")
 
         self._last_accepted_generation = snapshot.generation
+        self._generation_high_watermark = (
+            snapshot.generation
+            if self._generation_high_watermark is None
+            else max(self._generation_high_watermark, snapshot.generation)
+        )
         self._last_accepted_policy_id = snapshot.policy_id
         self._last_accepted_expires_at = snapshot.expires_at
         self._last_accepted_max_num_seqs = (

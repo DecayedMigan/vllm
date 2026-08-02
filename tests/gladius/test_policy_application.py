@@ -114,8 +114,12 @@ def test_default_decision_is_reported_as_fallback(tmp_path) -> None:
 
     payload = json.loads(path.read_text())
     assert payload["state"] == "fallback"
-    assert payload["generation"] == 0
-    assert payload["policy_id"] == "startup-default"
+    # Schema 1.x reported a synthetic generation 0 / "startup-default"
+    # identity here, which invented a policy the scheduler never accepted.
+    # Execution-evidence 2.0.0 states the truth: no policy is applied.
+    assert payload["generation"] is None
+    assert payload["policy_id"] is None
+    assert payload["decision_id"] is None
 
 
 def test_application_write_failure_is_fail_open(tmp_path, monkeypatch) -> None:
@@ -125,7 +129,7 @@ def test_application_write_failure_is_fail_open(tmp_path, monkeypatch) -> None:
     def _raise(*args, **kwargs):
         raise OSError("disk full")
 
-    monkeypatch.setattr("gladius_vllm.application.os.replace", _raise)
+    monkeypatch.setattr("gladius_vllm.atomic.os.replace", _raise)
     writer.record(
         _decision(),
         scheduler_step=1,

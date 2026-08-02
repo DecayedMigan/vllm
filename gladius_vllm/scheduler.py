@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 from gladius_vllm.application import PolicyApplicationWriter
 from gladius_vllm.policy import PolicyLoader
+from gladius_vllm.receipt import publish_startup_attestation
 from gladius_vllm.registry import register_scheduler
 from gladius_vllm.schema import (
     DEFAULT_POLICY_POLL_INTERVAL_MS,
@@ -103,16 +104,29 @@ class GladiusScheduler(Scheduler):
             model_id=self.model_id,
         )
         self._application_writer = PolicyApplicationWriter(
-            path=(
-                policy_dir / POLICY_APPLICATION_FILENAME
-                if policy_dir
-                else None
-            ),
+            path=(policy_dir / POLICY_APPLICATION_FILENAME if policy_dir else None),
             engine_id=self.engine_id,
             model_id=self.model_id,
         )
+        # EngineCore-side half of the server-start receipt: this process is
+        # the only one that can prove which physical GPU the model landed on
+        # and which binaries it loaded. The API process contributes its own
+        # identity separately (`python -m gladius_vllm.attest publish`), and
+        # this binding adopts the joined `server_instance_id` once that
+        # lands. Fail-open: an unattested server still serves, it just
+        # cannot certify a formal discovery cell.
+        self._instance_binding = publish_startup_attestation(
+            self.vllm_config,
+            policy_dir=policy_dir,
+            startup_max_num_seqs=self.startup_max_num_seqs,
+            startup_max_num_batched_tokens=self.startup_max_num_batched_tokens,
+        )
 
         register_scheduler(self)
+
+    @property
+    def server_instance_id(self) -> str | None:
+        return self._instance_binding.server_instance_id
 
     def schedule(self, *args: object, **kwargs: object) -> SchedulerOutput:
         # Forward whatever the active vLLM runtime supplies rather than
@@ -141,18 +155,27 @@ class GladiusScheduler(Scheduler):
 
         output = super().schedule(*args, **kwargs)
 
+        # Cheap no-op once the receipt has been adopted; before then it is a
+        # rate-unbounded stat() only while the server is still unattested.
+        server_instance_id = self._instance_binding.refresh()
+        generation_high_watermark = self._policy_loader.generation_high_watermark
+
         self._telemetry_writer.record(
             self,
             output,
             decision,
             policy_poll_ns=policy_poll_ns,
             policy_apply_ns=policy_apply_ns,
+            server_instance_id=server_instance_id,
+            generation_high_watermark=generation_high_watermark,
         )
         self._application_writer.record(
             decision,
             scheduler_step=self._telemetry_writer.step,
             effective_max_num_seqs=self.max_num_running_reqs,
             effective_max_num_batched_tokens=self.max_num_scheduled_tokens,
+            server_instance_id=server_instance_id,
+            generation_high_watermark=generation_high_watermark,
         )
         return output
 

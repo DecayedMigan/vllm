@@ -7,6 +7,6 @@ protocol (`policy_snapshot.json` in, `telemetry.jsonl` out). See
 vLLM's existing `--scheduler-cls` plugin mechanism.
 """
 
-from gladius_vllm.schema import SCHEMA_VERSION
+from gladius_vllm.schema import EXECUTION_EVIDENCE_SCHEMA_VERSION, SCHEMA_VERSION
 
-__all__ = ["SCHEMA_VERSION"]
+__all__ = ["EXECUTION_EVIDENCE_SCHEMA_VERSION", "SCHEMA_VERSION"]
