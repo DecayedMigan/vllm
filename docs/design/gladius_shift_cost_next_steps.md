@@ -9,6 +9,13 @@
 **Status:** implementation handoff; this document freezes the next execution-plane
 milestone before runtime changes are committed.
 
+**Four-H100 discovery review gate:**
+[`gladius_h100_discovery_execution_plane_requirements.md`](gladius_h100_discovery_execution_plane_requirements.md).
+The current execution-plane revision `fbcec19ed` is not sufficient to certify the
+realistic four-replica discovery experiment; the nonce-bound receipt,
+server-instance linkage, generation high-watermark, and strengthened seal in that
+document are required before deployment.
+
 ## 1. Goal and evidence boundary
 
 The next milestone reduces the cost of adapting after recurring workload shifts
