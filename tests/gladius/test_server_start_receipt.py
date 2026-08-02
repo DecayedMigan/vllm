@@ -193,9 +193,16 @@ def test_assembly_refuses_to_overwrite_another_instances_receipt(tmp_path):
     )
     assert again.server_instance_id == first.server_instance_id
 
-    # ...but a different EngineCore in the same directory is refused outright
+    # ...but a different *instance* in the same directory is refused outright
     # rather than silently inheriting the running campaign's evidence.
-    _publish_contribution(tmp_path, engine_core_pid=os.getpid() + 1)
+    #
+    # The difference is a different bound GPU rather than `os.getpid() + 1`.
+    # That PID may or may not be a live process depending on what else the
+    # machine is doing, so it made this test assert "was replaced" or "no
+    # longer running" by luck -- a four-process smoke run in the same session
+    # was enough to flip it. A changed GPU UUID is a different instance
+    # deterministically, and reaches the directory check every time.
+    _publish_contribution(tmp_path, physical_gpu_uuid="GPU-a-different-card")
     with pytest.raises(ReceiptError, match="must use a new policy directory"):
         assemble_server_start_receipt(
             tmp_path,
