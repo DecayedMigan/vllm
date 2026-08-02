@@ -160,8 +160,8 @@ binding all held against evidence a real server wrote.
 
 | Repository | Branch | Commit |
 |---|---|---|
-| vLLM fork | `feature/gladius-v3-vllm-engine` | see `git log` at handoff time |
-| SMIG | `agent/h100-discovery` | see `git log` at handoff time |
+| vLLM fork | `feature/gladius-v3-vllm-engine` | `cb6ab6228be4870737a0e90774b70083d7259975` |
+| SMIG | `agent/h100-discovery` | `fd28d086a56eb40d432a06e0de812b5af4205ab0` |
 
 | Shared artifact | sha256 |
 |---|---|
