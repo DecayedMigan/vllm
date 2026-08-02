@@ -328,3 +328,56 @@ requirements. Until both repository handoffs pass independent review:
 - do not start the 864-cell discovery run;
 - do not describe either repository as H100 discovery ready;
 - do not start an adaptive GLADIUS pilot.
+
+---
+
+## Implementation status (2026-08-02)
+
+Implemented in commit `c9248aa0` on `feature/gladius-v3-vllm-engine`.
+
+- **P0-A** `gladius_vllm/receipt.py`, `digest.py`, `attest.py`. The EngineCore
+  process publishes `server_start_receipt.engine.json` (its own reuse-proof
+  process identity, the physical GPU UUID read from inside the model process,
+  canonical tree digests of the model/tokenizer/vLLM package/loaded native
+  extensions/overlay, and the startup execution mode). The attestor CLI, run
+  once the API socket is bound, resolves the listening PID from `/proc` and
+  joins its own reuse-proof identity. `server_instance_id` digests both plus
+  the launcher nonce; a second EngineCore in the same policy directory is
+  refused rather than allowed to inherit a running campaign's evidence.
+- **P0-B** `application.py`. Adds `server_instance_id` and
+  `generation_high_watermark`. A native decision now reports generation,
+  policy id, and decision id as null instead of the synthetic
+  `0`/`startup-default` identity schema 1.x invented. The watermark survives
+  expiry, corrupt input, mismatch, regression, and fallback.
+- **P0-C** `telemetry.py`. Same two fields, and
+  `(generation is None) == (policy_id is None) == (decision_id is None)`
+  enforced in both writer and parser. Half-native records are rejected.
+- **P0-D** `telemetry.py`. The seal parses every record before certifying it
+  (one instance, strictly increasing steps, non-empty) and binds the receipt
+  and final application digests; `verify_telemetry_seal()` re-derives it all.
+
+Shared fixture `tests/gladius/fixtures/gladius-execution-evidence-v2.json`,
+committed byte-identical in SMIG at `tests/fixtures/`:
+`sha256 6ea973619267c462c0d4b6cc64aa2e6d76b6ff354a5f39ddae1123f780a77fd0`.
+
+Tests: `python -m pytest tests/gladius -q` -> **182 passed** (180 CPU + 2
+GPU-backed). Ruff `check` and `format --check` clean on `gladius_vllm/` and
+`tests/gladius/`. The ten required tests live in
+`test_server_start_receipt.py`, `test_execution_evidence_v2.py`,
+`test_telemetry_seal_v2.py`, and the call-shape test in
+`test_gladius_scheduler_cpu.py`.
+
+Partial real-hardware result: steps 2-5 of the §9 acceptance sequence were run
+against a **live single-GPU ROCm server** — receipt validation, activation, an
+unclamped active application bound to the attested instance, a generation
+raise, and equal/lower-generation rejection without watermark regression.
+19/19 checks passed against a genuine two-process server
+(`api_pid != engine_core_pid`, both measured from `/proc`).
+
+**Not established:** anything requiring four H100s. Specifically the NVML
+GPU-UUID branch of the receipt is unverified (this host is ROCm and exercised
+only the `torch` fallback), no receipt produced here satisfies the frozen
+Qwen3-8B startup values, and §9's four-GPU sequence has not been run. Per §10,
+this contract's completion is necessary but not sufficient: do not SCP a
+formal archive, start the 864-cell run, describe either repository as H100
+discovery ready, or start an adaptive pilot.
