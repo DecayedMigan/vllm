@@ -9,6 +9,9 @@
 
 **Status:** required execution-plane handoff; the four-H100 discovery campaign is
 blocked until the P0 contract and shared acceptance tests in this document pass.
+The implementation at `c9248aa01` has been independently re-reviewed; the
+[second-review requirements](gladius_h100_discovery_execution_plane_second_review.md)
+are additive and supersede any later “implementation complete” readiness claim.
 
 ## 1. Scope and ownership
 
