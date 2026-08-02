@@ -11,6 +11,13 @@
 **Parent contract:**
 [`gladius_h100_discovery_execution_plane_requirements.md`](gladius_h100_discovery_execution_plane_requirements.md)
 
+**Third-review status:** the later implementation claim is **not accepted**.
+Independent mutation probes found that the seal verifies sibling hashes but not
+their deployment/application semantics, and no production lifecycle path calls
+the seal. Additional receipt, GPU-identity, socket-ownership, and writer-race
+gaps remain. Do not package this branch for H100 work. The controlling plan is
+[`../superpowers/plans/2026-08-02-h100-execution-plane-third-review-remediation.md`](../superpowers/plans/2026-08-02-h100-execution-plane-third-review-remediation.md).
+
 **Decision:** changes required. Do not package this revision for the formal H100
 campaign. The following P0 issues invalidate physical-GPU identity or allow an
 unattested or mutable telemetry stream to pass the current seal verifier.
