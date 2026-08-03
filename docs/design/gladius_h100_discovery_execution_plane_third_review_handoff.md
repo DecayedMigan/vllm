@@ -5,6 +5,32 @@ explicit that this document may say "implemented" only after an independent
 reviewer checks out the published commits in clean directories and
 reproduces every gate. That has not happened.
 
+## 2026-08-03 corrective implementation note
+
+Re-review found that the candidate documented below still allowed a formal
+seal to lose its deployment or generation binding: a server launched without
+`GLADIUS_DEPLOYMENT_MANIFEST_SHA256` skipped the digest comparison, a missing
+observed generation passed, and a request naming an older generation was
+accepted. The seal parser also accepted a non-digest deployment value and a
+null final generation.
+
+This correction makes all four conditions fail closed. A sealing server must
+have both the launch-time deployment digest and attestation nonce; the request
+must carry a lowercase 64-character SHA-256 and a non-negative integer final
+generation; that generation must equal the live high-water mark exactly.
+`gladius_vllm.attest seal` therefore requires
+`--expect-final-generation`. The four-process smoke supplies the same bound
+deployment digest to the server and request and first activates a real
+generation-one policy before requesting the exact generation-one seal.
+
+Six focused pure-protocol tests pass locally. The full vLLM adversarial suite
+cannot be certified on this macOS environment: Linux `/proc` is absent and
+the local vLLM dependency set also lacks `cbor2` (the repository-level pytest
+bootstrap additionally encounters the installed SciPy/sklearn mismatch).
+The Linux and real-server ladders below remain mandatory. The historical
+commit table and aggregate pass counts below describe the superseded
+candidate, not this correction.
+
 Controlling plan:
 [`2026-08-02-h100-execution-plane-third-review-remediation.md`](../superpowers/plans/2026-08-02-h100-execution-plane-third-review-remediation.md)
 (commit `01dae4d2`). Rejected revision: `c311bc0`.

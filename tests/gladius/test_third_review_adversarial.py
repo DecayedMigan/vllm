@@ -444,7 +444,7 @@ def test_live_server_seal_request_creates_terminal_artifacts(tmp_path, monkeypat
         policy_dir,
         server_instance_id=scheduler.server_instance_id,
         deployment_manifest_sha256="0" * 64,
-        expected_final_generation=None,
+        expected_final_generation=0,
         attestation_nonce=nonce,
     )
     assert (policy_dir / SEAL_REQUEST_FILENAME).is_file()
@@ -523,6 +523,112 @@ def test_concurrent_writers_cannot_interleave_across_a_seal(tmp_path):
     for writer in writers:
         with pytest.raises(ValueError):
             writer.append_record(telemetry_record(99))
+
+
+@pytest.mark.parametrize(
+    ("server_digest", "observed_generation"),
+    [
+        (None, 42),
+        ("a" * 64, None),
+        ("a" * 64, 43),
+    ],
+)
+def test_seal_request_never_skips_deployment_or_exact_generation_binding(
+    server_digest, observed_generation
+):
+    from gladius_vllm.evidence_codes import (
+        SEAL_REQUEST_DEPLOYMENT_CHANGED,
+        SEAL_REQUEST_STALE_GENERATION,
+    )
+    from gladius_vllm.seal_lifecycle import SealRequest, classify_refusal
+
+    request = SealRequest(
+        request_id="seal-a",
+        server_instance_id="srv-a",
+        deployment_manifest_sha256="a" * 64,
+        expected_final_generation=42,
+        attestation_nonce="nonce-a",
+        requested_at="2026-08-03T00:00:00Z",
+    )
+
+    refusal = classify_refusal(
+        request,
+        server_instance_id="srv-a",
+        deployment_manifest_sha256=server_digest,
+        attestation_nonce="nonce-a",
+        observed_generation=observed_generation,
+        already_retired=False,
+    )
+
+    expected = (
+        SEAL_REQUEST_DEPLOYMENT_CHANGED
+        if server_digest is None
+        else SEAL_REQUEST_STALE_GENERATION
+    )
+    assert refusal is not None and expected in refusal
+
+
+def test_seal_request_refuses_a_server_without_an_attestation_nonce():
+    from gladius_vllm.evidence_codes import SEAL_REQUEST_FOREIGN_INSTANCE
+    from gladius_vllm.seal_lifecycle import SealRequest, classify_refusal
+
+    refusal = classify_refusal(
+        SealRequest(
+            request_id="seal-a",
+            server_instance_id="srv-a",
+            deployment_manifest_sha256="a" * 64,
+            expected_final_generation=42,
+            attestation_nonce="nonce-a",
+            requested_at="2026-08-03T00:00:00Z",
+        ),
+        server_instance_id="srv-a",
+        deployment_manifest_sha256="a" * 64,
+        attestation_nonce=None,
+        observed_generation=42,
+        already_retired=False,
+    )
+
+    assert refusal is not None and SEAL_REQUEST_FOREIGN_INSTANCE in refusal
+
+
+def test_seal_request_parser_requires_a_sha256_deployment_digest():
+    from gladius_vllm.evidence_codes import SEAL_REQUEST_SCHEMA_INVALID
+    from gladius_vllm.seal_lifecycle import SealRequestError, parse_seal_request
+
+    with pytest.raises(SealRequestError) as caught:
+        parse_seal_request(
+            {
+                "schema_version": "2.0.0",
+                "request_id": "seal-a",
+                "server_instance_id": "srv-a",
+                "deployment_manifest_sha256": "not-a-digest",
+                "expected_final_generation": 42,
+                "attestation_nonce": "nonce-a",
+                "requested_at": "2026-08-03T00:00:00Z",
+            }
+        )
+
+    assert SEAL_REQUEST_SCHEMA_INVALID in str(caught.value)
+
+
+def test_seal_request_parser_requires_an_exact_final_generation():
+    from gladius_vllm.evidence_codes import SEAL_REQUEST_SCHEMA_INVALID
+    from gladius_vllm.seal_lifecycle import SealRequestError, parse_seal_request
+
+    with pytest.raises(SealRequestError) as caught:
+        parse_seal_request(
+            {
+                "schema_version": "2.0.0",
+                "request_id": "seal-a",
+                "server_instance_id": "srv-a",
+                "deployment_manifest_sha256": "a" * 64,
+                "expected_final_generation": None,
+                "attestation_nonce": "nonce-a",
+                "requested_at": "2026-08-03T00:00:00Z",
+            }
+        )
+
+    assert SEAL_REQUEST_SCHEMA_INVALID in str(caught.value)
 
 
 # --- 10: both repositories refuse the same invalid corpus ----------------

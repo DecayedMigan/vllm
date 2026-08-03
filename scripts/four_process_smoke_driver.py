@@ -20,12 +20,14 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from gladius_vllm.atomic import atomic_write_json  # noqa: E402
 from gladius_vllm.netowner import listen_socket_owner_pid  # noqa: E402
 from gladius_vllm.receipt import (  # noqa: E402
     DeploymentExpectation,
@@ -168,6 +170,25 @@ def main(argv: list[str] | None = None) -> int:
             receipt, formal
         )
 
+        now = datetime.now(timezone.utc)
+        atomic_write_json(
+            policy_dir / "policy_snapshot.json",
+            {
+                "schema_version": "1.0.0",
+                "generation": 1,
+                "policy_id": f"smoke-lane{lane}-generation1",
+                "model_id": receipt.model_id,
+                "engine_id": receipt.engine_id,
+                "created_at": now.isoformat().replace("+00:00", "Z"),
+                "expires_at": (now + timedelta(minutes=30))
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "admission": {
+                    "max_num_seqs": 4,
+                    "max_num_batched_tokens": 1024,
+                },
+            },
+        )
         entry["request"] = send_one(port)
         report["lanes"].append(entry)
 
@@ -178,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
             policy_dir,
             server_instance_id=receipt.server_instance_id,
             deployment_manifest_sha256="0" * 64,
-            expected_final_generation=None,
+            expected_final_generation=1,
             attestation_nonce=receipt.attestation_nonce,
         )
 

@@ -67,6 +67,7 @@ for lane in $(seq 0 $((LANES - 1))); do
   GLADIUS_POLICY_DIR="$policy_dir" \
   GLADIUS_ENGINE_ID="gladius-smoke-gpu$lane" \
   GLADIUS_ATTESTATION_NONCE="$nonce" \
+  GLADIUS_DEPLOYMENT_MANIFEST_SHA256="$(printf '0%.0s' {1..64})" \
   GLADIUS_TELEMETRY_SAMPLE_N=1 \
   VLLM_LOGGING_LEVEL=WARNING \
     "$PYTHON" -m vllm.entrypoints.openai.api_server \

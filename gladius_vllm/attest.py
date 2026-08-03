@@ -119,8 +119,8 @@ def _build_parser() -> argparse.ArgumentParser:
     seal.add_argument(
         "--expect-final-generation",
         type=int,
-        default=None,
-        help="refuse to seal before the server has reached this generation",
+        required=True,
+        help="require the server to be at exactly this final generation",
     )
     seal.add_argument("--wait-seconds", type=float, default=300.0)
 

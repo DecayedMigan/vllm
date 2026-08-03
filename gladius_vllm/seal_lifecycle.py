@@ -76,7 +76,7 @@ class SealRequest:
     request_id: str
     server_instance_id: str
     deployment_manifest_sha256: str
-    expected_final_generation: int | None
+    expected_final_generation: int
     attestation_nonce: str
     requested_at: str
 
@@ -119,8 +119,18 @@ def parse_seal_request(payload: object) -> SealRequest:
                     SEAL_REQUEST_SCHEMA_INVALID, f"{field} must be a non-empty string"
                 )
             )
+    digest = payload["deployment_manifest_sha256"]
+    if len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise SealRequestError(
+            classify(
+                SEAL_REQUEST_SCHEMA_INVALID,
+                "deployment_manifest_sha256 must be a lowercase SHA-256 digest",
+            )
+        )
     generation = payload["expected_final_generation"]
-    if generation is not None and (
+    if (
         isinstance(generation, bool)
         or not isinstance(generation, int)
         or generation < 0
@@ -128,7 +138,7 @@ def parse_seal_request(payload: object) -> SealRequest:
         raise SealRequestError(
             classify(
                 SEAL_REQUEST_SCHEMA_INVALID,
-                "expected_final_generation must be a non-negative integer or null",
+                "expected_final_generation must be a non-negative integer",
             )
         )
     return SealRequest(
@@ -146,7 +156,7 @@ def write_seal_request(
     *,
     server_instance_id: str,
     deployment_manifest_sha256: str,
-    expected_final_generation: int | None,
+    expected_final_generation: int,
     attestation_nonce: str,
     request_id: str | None = None,
 ) -> Path:
@@ -240,30 +250,38 @@ def classify_refusal(
             f"seal request names instance {request.server_instance_id!r}, but "
             f"this server is {server_instance_id!r}",
         )
-    if attestation_nonce is not None and request.attestation_nonce != attestation_nonce:
+    if attestation_nonce is None:
+        return classify(
+            SEAL_REQUEST_FOREIGN_INSTANCE,
+            "this server was launched without an attestation nonce and cannot "
+            "certify evidence",
+        )
+    if request.attestation_nonce != attestation_nonce:
         return classify(
             SEAL_REQUEST_FOREIGN_INSTANCE,
             "seal request carries a different attestation nonce; it belongs to "
             "another launch",
         )
-    if (
-        deployment_manifest_sha256 is not None
-        and request.deployment_manifest_sha256 != deployment_manifest_sha256
-    ):
+    if deployment_manifest_sha256 is None:
+        return classify(
+            SEAL_REQUEST_DEPLOYMENT_CHANGED,
+            "this server was launched without a deployment-manifest digest; "
+            "an unbound server cannot certify formal evidence",
+        )
+    if request.deployment_manifest_sha256 != deployment_manifest_sha256:
         return classify(
             SEAL_REQUEST_DEPLOYMENT_CHANGED,
             "seal request was written against a different deployment manifest",
         )
     if (
-        request.expected_final_generation is not None
-        and observed_generation is not None
-        and request.expected_final_generation > observed_generation
+        observed_generation is None
+        or request.expected_final_generation != observed_generation
     ):
         return classify(
             SEAL_REQUEST_STALE_GENERATION,
             f"seal request expects final generation "
-            f"{request.expected_final_generation}, but this instance has only "
-            f"reached {observed_generation}",
+            f"{request.expected_final_generation}, but this instance is at "
+            f"{observed_generation}; both older and future requests are stale",
         )
     if already_retired:
         return classify(

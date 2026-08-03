@@ -66,8 +66,11 @@ process that owns `GladiusScheduler` must jointly produce and atomically publish
 GLADIUS_POLICY_DIR/server_start_receipt.json
 ```
 
-The launcher provides a unique, unpredictable `GLADIUS_ATTESTATION_NONCE` and
-the expected endpoint/visible-GPU mapping. The final receipt is emitted only
+The launcher provides a unique, unpredictable `GLADIUS_ATTESTATION_NONCE`, the
+lowercase SHA-256 of the exact four-lane deployment manifest as
+`GLADIUS_DEPLOYMENT_MANIFEST_SHA256`, and the expected endpoint/visible-GPU
+mapping. A formal server launched without either binding must refuse terminal
+sealing. The final receipt is emitted only
 after the API socket is bound and the EngineCore confirms that the model,
 tokenizer, CUDA device, scheduler, prefix cache, chunked prefill, and startup
 execution mode are initialized. It contains strictly parsed fields covering:
