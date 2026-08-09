@@ -23,6 +23,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
 from vllm.v1.core.block_pool import BlockHashToBlockMap, BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager, Request
+from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashWithGroupId,
@@ -2126,6 +2127,323 @@ def test_maybe_evict_cached_block():
     # Evict block3
     pool._maybe_evict_cached_block(block3)
     assert pool.cached_block_hash_to_block._cache == {}
+
+
+@pytest.mark.parametrize(
+    ("num_blocks", "expected_ids", "remaining_ids"),
+    [
+        (5, [2, 5, 3, 6, 1], [4]),
+        (6, [2, 5, 3, 6, 1, 4], []),
+    ],
+)
+def test_get_new_blocks_prefers_unprotected_hashes_in_stable_tiers(
+    num_blocks: int, expected_ids: list[int], remaining_ids: list[int]
+):
+    pool = BlockPool(num_gpu_blocks=7, enable_caching=True, hash_block_size=4)
+    protected_first = make_block_hash_with_group_id(BlockHash(b"a"), 1)
+    unprotected_first = make_block_hash_with_group_id(BlockHash(b"b"), 1)
+    protected_second = make_block_hash_with_group_id(BlockHash(b"c"), 2)
+    same_raw_other_group = make_block_hash_with_group_id(BlockHash(b"a"), 2)
+    hashes_by_id = {
+        1: protected_first,
+        3: unprotected_first,
+        4: protected_second,
+        6: same_raw_other_group,
+    }
+    for block_id, block_hash in hashes_by_id.items():
+        block = pool.blocks[block_id]
+        block.block_hash = block_hash
+        pool.cached_block_hash_to_block.insert(block_hash, block)
+
+    assert get_block_hash(protected_first) == get_block_hash(same_raw_other_group)
+    selected = pool.get_new_blocks(
+        num_blocks,
+        protected_hashes=frozenset({protected_first, protected_second}),
+    )
+
+    assert [block.block_id for block in selected] == expected_ids
+    assert [
+        block.block_id for block in pool.free_block_queue.get_all_free_blocks()
+    ] == remaining_ids
+
+
+def _insert_cached_blocks(
+    pool: BlockPool, hashes_by_id: dict[int, BlockHashWithGroupId]
+) -> None:
+    for block_id, block_hash in hashes_by_id.items():
+        block = pool.blocks[block_id]
+        block.block_hash = block_hash
+        pool.cached_block_hash_to_block.insert(block_hash, block)
+
+
+def _block_pool_observable_state(pool: BlockPool):
+    cache_state = []
+    for block_hash, cached in pool.cached_block_hash_to_block._cache.items():
+        block_ids = (
+            (cached.block_id,)
+            if isinstance(cached, KVCacheBlock)
+            else tuple(sorted(cached))
+        )
+        cache_state.append((block_hash, block_ids))
+    event_state = tuple(
+        (tuple(event.block_hashes), event.group_idx)
+        for event in pool.kv_event_queue
+        if isinstance(event, BlockRemoved)
+    )
+    metrics = pool.metrics_collector
+    assert metrics is not None
+    return (
+        pool.get_num_free_blocks(),
+        tuple(block.block_id for block in pool.free_block_queue.get_all_free_blocks()),
+        tuple(
+            (
+                block.block_id,
+                block.ref_cnt,
+                block.block_hash,
+                block.prev_free_block.block_id if block.prev_free_block else None,
+                block.next_free_block.block_id if block.next_free_block else None,
+            )
+            for block in pool.blocks
+        ),
+        tuple(sorted(cache_state)),
+        event_state,
+        tuple(sorted(metrics.block_metrics)),
+    )
+
+
+def _make_fast_path_pool() -> BlockPool:
+    pool = BlockPool(
+        num_gpu_blocks=5,
+        enable_caching=True,
+        hash_block_size=4,
+        enable_kv_cache_events=True,
+        metrics_collector=KVCacheMetricsCollector(sample_rate=1.0),
+    )
+    _insert_cached_blocks(
+        pool,
+        {
+            1: make_block_hash_with_group_id(BlockHash(b"cached-1"), 3),
+            3: make_block_hash_with_group_id(BlockHash(b"cached-3"), 4),
+        },
+    )
+    return pool
+
+
+@pytest.mark.parametrize("protected_hashes", [None, frozenset()])
+def test_empty_protection_is_identical_to_upstream_fast_path(
+    protected_hashes: frozenset[BlockHashWithGroupId] | None, monkeypatch
+):
+    queue_reference = _make_fast_path_pool()
+    expected_selected = queue_reference.free_block_queue.popleft_n(3)
+    expected_selected_ids = [block.block_id for block in expected_selected]
+    expected_remaining_ids = [
+        block.block_id
+        for block in queue_reference.free_block_queue.get_all_free_blocks()
+    ]
+
+    upstream = _make_fast_path_pool()
+    upstream_selected = upstream.get_new_blocks(3)
+
+    actual = _make_fast_path_pool()
+    popleft_n = Mock(wraps=actual.free_block_queue.popleft_n)
+    prefer_unprotected = Mock(
+        wraps=actual.free_block_queue.popleft_n_prefer_unprotected
+    )
+    monkeypatch.setattr(actual.free_block_queue, "popleft_n", popleft_n)
+    monkeypatch.setattr(
+        actual.free_block_queue,
+        "popleft_n_prefer_unprotected",
+        prefer_unprotected,
+    )
+    actual_selected = actual.get_new_blocks(
+        3,
+        protected_hashes=protected_hashes,
+    )
+
+    assert [block.block_id for block in upstream_selected] == expected_selected_ids
+    assert [block.block_id for block in actual_selected] == expected_selected_ids
+    assert [
+        block.block_id for block in actual.free_block_queue.get_all_free_blocks()
+    ] == expected_remaining_ids
+    assert _block_pool_observable_state(actual) == _block_pool_observable_state(
+        upstream
+    )
+    popleft_n.assert_called_once_with(3)
+    prefer_unprotected.assert_not_called()
+
+
+def test_protection_never_pins_blocks_or_selects_an_in_use_block():
+    pool = BlockPool(
+        num_gpu_blocks=6,
+        enable_caching=True,
+        hash_block_size=4,
+        enable_kv_cache_events=True,
+    )
+    protected_hashes = {
+        make_block_hash_with_group_id(BlockHash(f"cached-{block_id}".encode()), 5)
+        for block_id in range(1, 6)
+    }
+    hashes_by_id = dict(zip(range(1, 6), sorted(protected_hashes)))
+    _insert_cached_blocks(pool, hashes_by_id)
+    in_use = pool.blocks[2]
+    in_use_hash = in_use.block_hash
+    assert in_use_hash is not None
+    pool.touch([in_use])
+
+    selected = pool.get_new_blocks(
+        pool.get_num_free_blocks(),
+        protected_hashes=frozenset(protected_hashes),
+    )
+
+    assert [block.block_id for block in selected] == [1, 3, 4, 5]
+    assert len({block.block_id for block in selected}) == len(selected)
+    assert all(block.ref_cnt == 1 for block in selected)
+    assert pool.get_num_free_blocks() == 0
+    assert in_use not in selected
+    assert in_use.ref_cnt == 1
+    assert in_use.block_hash == in_use_hash
+    assert pool.cached_block_hash_to_block.get_one_block(in_use_hash) is in_use
+
+
+def test_protected_eviction_preserves_maps_metrics_and_removal_events():
+    metrics = KVCacheMetricsCollector(sample_rate=1.0)
+    pool = BlockPool(
+        num_gpu_blocks=8,
+        enable_caching=True,
+        hash_block_size=4,
+        enable_kv_cache_events=True,
+        metrics_collector=metrics,
+    )
+    protected_duplicate = make_block_hash_with_group_id(BlockHash(b"p"), 1)
+    unprotected_first = make_block_hash_with_group_id(BlockHash(b"u1"), 2)
+    protected_other = make_block_hash_with_group_id(BlockHash(b"q"), 3)
+    unprotected_second = make_block_hash_with_group_id(BlockHash(b"u2"), 4)
+    _insert_cached_blocks(
+        pool,
+        {
+            1: protected_duplicate,
+            3: unprotected_first,
+            4: protected_other,
+            6: unprotected_second,
+            7: protected_duplicate,
+        },
+    )
+    initial_free = pool.get_num_free_blocks()
+
+    selected = pool.get_new_blocks(
+        5,
+        protected_hashes=frozenset({protected_duplicate, protected_other}),
+    )
+
+    assert [block.block_id for block in selected] == [2, 5, 3, 6, 1]
+    assert len({block.block_id for block in selected}) == 5
+    assert pool.get_num_free_blocks() == initial_free - len(selected) == 2
+    assert all(block.ref_cnt == 1 for block in selected)
+    assert all(block.block_hash is None for block in selected)
+    assert [
+        block.block_id for block in pool.free_block_queue.get_all_free_blocks()
+    ] == [4, 7]
+    assert all(pool.blocks[block_id].ref_cnt == 0 for block_id in (4, 7))
+    assert (
+        pool.cached_block_hash_to_block.get_one_block(protected_other) is pool.blocks[4]
+    )
+    assert (
+        pool.cached_block_hash_to_block.get_one_block(protected_duplicate)
+        is pool.blocks[7]
+    )
+    assert len(pool.cached_block_hash_to_block) == 2
+    assert set(metrics.block_metrics) == {1, 2, 3, 5, 6}
+    removed_events = [
+        event for event in pool.take_events() if isinstance(event, BlockRemoved)
+    ]
+    assert [(event.block_hashes, event.group_idx) for event in removed_events] == [
+        (
+            [kv_cache_utils.maybe_convert_block_hash(get_block_hash(block_hash))],
+            get_group_id(block_hash),
+        )
+        for block_hash in (
+            unprotected_first,
+            unprotected_second,
+            protected_duplicate,
+        )
+    ]
+
+
+def test_tracker_closure_is_preferred_and_no_recurrence_uses_fast_path(
+    monkeypatch,
+):
+    root = make_block_hash_with_group_id(BlockHash(b"root"), 6)
+    child = make_block_hash_with_group_id(BlockHash(b"child"), 6)
+    leaf = make_block_hash_with_group_id(BlockHash(b"leaf"), 6)
+    chain = (root, child, leaf)
+    tracker = PrefixRetentionTracker(
+        policy=PrefixRetentionPolicy.PREFIX_RECENCY,
+        budget_blocks=3,
+        hash_block_size=4,
+    )
+    assert tracker.register_chain(chain)
+    assert tracker.record_completed_access(chain)
+    snapshot = tracker.snapshot(reversed(chain))
+    protected_hashes = tracker.protected_hashes(snapshot)
+    metadata = {item.block_hash: item for item in snapshot.metadata}
+    assert protected_hashes == frozenset(chain)
+    for block_hash in protected_hashes:
+        parent = metadata[block_hash].parent
+        while parent is not None:
+            assert parent in protected_hashes
+            parent = metadata[parent].parent
+
+    pool = BlockPool(num_gpu_blocks=5, enable_caching=True, hash_block_size=4)
+    _insert_cached_blocks(pool, {1: root, 3: child, 4: leaf})
+    assert [
+        block.block_id
+        for block in pool.get_new_blocks(1, protected_hashes=protected_hashes)
+    ] == [2]
+    assert all(
+        pool.cached_block_hash_to_block.get_one_block(block_hash) is not None
+        for block_hash in chain
+    )
+    assert [
+        block.block_id
+        for block in pool.get_new_blocks(1, protected_hashes=protected_hashes)
+    ] == [1]
+
+    no_recurrence = PrefixRetentionTracker(
+        policy=PrefixRetentionPolicy.RECURPLAN,
+        budget_blocks=1,
+        hash_block_size=4,
+    )
+    assert no_recurrence.register_chain([root])
+    for _ in range(3):
+        assert no_recurrence.record_completed_access([root])
+    empty_protection = no_recurrence.protected_hashes(no_recurrence.snapshot([root]))
+    assert empty_protection == frozenset()
+
+    no_recurrence_pool = BlockPool(
+        num_gpu_blocks=3,
+        enable_caching=True,
+        hash_block_size=4,
+    )
+    _insert_cached_blocks(no_recurrence_pool, {1: root})
+    popleft_n = Mock(wraps=no_recurrence_pool.free_block_queue.popleft_n)
+    prefer_unprotected = Mock(
+        wraps=no_recurrence_pool.free_block_queue.popleft_n_prefer_unprotected
+    )
+    monkeypatch.setattr(no_recurrence_pool.free_block_queue, "popleft_n", popleft_n)
+    monkeypatch.setattr(
+        no_recurrence_pool.free_block_queue,
+        "popleft_n_prefer_unprotected",
+        prefer_unprotected,
+    )
+    assert [
+        block.block_id
+        for block in no_recurrence_pool.get_new_blocks(
+            1,
+            protected_hashes=empty_protection,
+        )
+    ] == [1]
+    popleft_n.assert_called_once_with(1)
+    prefer_unprotected.assert_not_called()
 
 
 @pytest.mark.parametrize("blocks_to_cache", [2, 3, 10])

@@ -8,6 +8,7 @@ import math
 import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any, NewType, TypeAlias, cast, overload
@@ -282,6 +283,60 @@ class FreeKVCacheBlockQueue:
             # the new first block.
             self.fake_free_list_head.next_free_block = curr_block
             curr_block.prev_free_block = self.fake_free_list_head
+        return ret
+
+    def popleft_n_prefer_unprotected(
+        self,
+        n: int,
+        protected_hashes: AbstractSet[BlockHashWithGroupId],
+    ) -> list[KVCacheBlock]:
+        """Pop free blocks in stable protection-preference tiers.
+
+        Unhashed blocks are selected first, then unprotected cached blocks,
+        and finally protected cached blocks when capacity requires them. This
+        method only unlinks blocks from the free list; their cache and
+        reference-count lifecycle remains owned by ``BlockPool``.
+
+        Args:
+            n: The number of blocks to pop.
+            protected_hashes: Group-aware cached block identities to prefer
+                retaining.
+
+        Returns:
+            A list of n free blocks in stable tier and LRU order.
+        """
+        if n == 0:
+            return []
+        assert self.num_free_blocks >= n
+
+        ret: list[KVCacheBlock] = []
+        for category in range(3):
+            curr_block = self.fake_free_list_head.next_free_block
+            if curr_block is None:
+                raise RuntimeError(
+                    "next_free_block of fake_free_list_head should always exist"
+                )
+            while curr_block is not self.fake_free_list_tail and len(ret) < n:
+                next_block = curr_block.next_free_block
+                if next_block is None:
+                    raise RuntimeError("Invalid block found in protected eviction scan")
+                block_hash = curr_block.block_hash
+                if category == 0:
+                    selected = block_hash is None
+                elif category == 1:
+                    selected = (
+                        block_hash is not None and block_hash not in protected_hashes
+                    )
+                else:
+                    selected = block_hash is not None and block_hash in protected_hashes
+                if selected:
+                    self.remove(curr_block)
+                    ret.append(curr_block)
+                curr_block = next_block
+            if len(ret) == n:
+                break
+
+        assert len(ret) == n
         return ret
 
     def remove(self, block: KVCacheBlock) -> None:

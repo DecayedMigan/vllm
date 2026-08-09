@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
+from collections.abc import Set as AbstractSet
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -345,13 +346,21 @@ class BlockPool:
                 )
             )
 
-    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+    def get_new_blocks(
+        self,
+        num_blocks: int,
+        *,
+        protected_hashes: AbstractSet[BlockHashWithGroupId] | None = None,
+    ) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
 
         Note that we do not check block cache in this function.
 
         Args:
             num_blocks: The number of blocks to allocate.
+            protected_hashes: Group-aware cached block identities to prefer
+                retaining. Protection is advisory and never prevents an
+                otherwise feasible allocation.
 
         Returns:
             A list of new block.
@@ -359,7 +368,12 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        if not protected_hashes:
+            ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        else:
+            ret = self.free_block_queue.popleft_n_prefer_unprotected(
+                num_blocks, protected_hashes
+            )
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
