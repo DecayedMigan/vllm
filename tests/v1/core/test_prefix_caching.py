@@ -2446,6 +2446,363 @@ def test_tracker_closure_is_preferred_and_no_recurrence_uses_fast_path(
     prefer_unprotected.assert_not_called()
 
 
+def _seed_retention_witness(
+    tracker: PrefixRetentionTracker,
+    recurring: BlockHashWithGroupId,
+    recent: BlockHashWithGroupId,
+) -> None:
+    filler = make_block_hash_with_group_id(BlockHash(b"filler"), 0)
+    for block_hash in (recurring, recent, filler):
+        assert tracker.register_chain([block_hash])
+    for ordinal in range(1, 17):
+        if ordinal in (1, 5, 9, 13):
+            block_hash = recurring
+        elif ordinal in (10, 11, 12, 14):
+            block_hash = recent
+        else:
+            block_hash = filler
+        assert tracker.record_completed_access([block_hash])
+
+
+@pytest.mark.parametrize(
+    ("policy", "budget", "expected_victim_id"),
+    [
+        (PrefixRetentionPolicy.LRU, 0, 1),
+        (PrefixRetentionPolicy.PREFIX_RECENCY, 1, 1),
+        (PrefixRetentionPolicy.LFU, 1, 1),
+        (PrefixRetentionPolicy.RECURPLAN, 1, 2),
+    ],
+)
+def test_manager_policy_changes_real_eviction_victim(
+    policy: PrefixRetentionPolicy,
+    budget: int,
+    expected_victim_id: int,
+):
+    block_size = 4
+    recurring = make_block_hash_with_group_id(BlockHash(b"recurring"), 0)
+    recent = make_block_hash_with_group_id(BlockHash(b"recent"), 0)
+    other = make_block_hash_with_group_id(BlockHash(b"other"), 0)
+    tracker = PrefixRetentionTracker(
+        policy=policy,
+        budget_blocks=budget,
+        hash_block_size=block_size,
+    )
+    _seed_retention_witness(tracker, recurring, recent)
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 4),
+        max_model_len=32,
+        enable_caching=True,
+        enable_kv_cache_events=True,
+        hash_block_size=block_size,
+        prefix_retention_tracker=tracker,
+    )
+    _insert_cached_blocks(
+        manager.block_pool,
+        {1: recurring, 2: recent, 3: other},
+    )
+
+    request = make_request("pressure", list(range(block_size)), block_size, sha256)
+    blocks = manager.allocate_slots(request, request.num_tokens)
+
+    assert blocks is not None
+    assert blocks.get_block_ids() == ([expected_victim_id],)
+    removed = [
+        event for event in manager.take_events() if isinstance(event, BlockRemoved)
+    ]
+    assert len(removed) == 1
+    expected_hash = recurring if expected_victim_id == 1 else recent
+    assert removed[0].block_hashes == [
+        kv_cache_utils.maybe_convert_block_hash(get_block_hash(expected_hash))
+    ]
+    assert removed[0].group_idx == get_group_id(expected_hash)
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        PrefixRetentionPolicy.PREFIX_RECENCY,
+        PrefixRetentionPolicy.LFU,
+        PrefixRetentionPolicy.RECURPLAN,
+    ],
+)
+def test_each_non_lru_policy_changes_actual_victim_from_lru(
+    policy: PrefixRetentionPolicy,
+):
+    block_size = 4
+    preferred = make_block_hash_with_group_id(BlockHash(b"preferred"), 0)
+    alternative = make_block_hash_with_group_id(BlockHash(b"alternative"), 0)
+    other = make_block_hash_with_group_id(BlockHash(b"other"), 0)
+    tracker = PrefixRetentionTracker(
+        policy=policy,
+        budget_blocks=1,
+        hash_block_size=block_size,
+    )
+    if policy is PrefixRetentionPolicy.RECURPLAN:
+        _seed_retention_witness(tracker, preferred, alternative)
+    else:
+        for block_hash in (preferred, alternative):
+            assert tracker.register_chain([block_hash])
+        if policy is PrefixRetentionPolicy.PREFIX_RECENCY:
+            assert tracker.record_completed_access([alternative])
+            assert tracker.record_completed_access([preferred])
+        else:
+            for _ in range(3):
+                assert tracker.record_completed_access([preferred])
+            assert tracker.record_completed_access([alternative])
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 4),
+        max_model_len=32,
+        enable_caching=True,
+        enable_kv_cache_events=True,
+        hash_block_size=block_size,
+        prefix_retention_tracker=tracker,
+    )
+    assert tracker is manager.prefix_retention_tracker
+    assert tracker is manager.block_pool.prefix_retention_tracker
+    _insert_cached_blocks(
+        manager.block_pool,
+        {1: preferred, 2: alternative, 3: other},
+    )
+
+    request = make_request(
+        f"pressure-{policy.value}",
+        list(range(block_size)),
+        block_size,
+        sha256,
+    )
+    blocks = manager.allocate_slots(request, request.num_tokens)
+
+    assert blocks is not None
+    assert blocks.get_block_ids() == ([2],)
+    removed = [
+        event for event in manager.take_events() if isinstance(event, BlockRemoved)
+    ]
+    assert len(removed) == 1
+    assert removed[0].block_hashes == [
+        kv_cache_utils.maybe_convert_block_hash(get_block_hash(alternative))
+    ]
+    assert removed[0].group_idx == get_group_id(alternative)
+
+
+def test_manager_non_lru_takes_one_live_snapshot(monkeypatch):
+    block_size = 4
+    raw_digest = BlockHash(b"same-raw-digest")
+    first = make_block_hash_with_group_id(raw_digest, 0)
+    second = make_block_hash_with_group_id(raw_digest, 7)
+    stale = make_block_hash_with_group_id(BlockHash(b"stale-history"), 0)
+    tracker = PrefixRetentionTracker(
+        policy=PrefixRetentionPolicy.PREFIX_RECENCY,
+        budget_blocks=1,
+        hash_block_size=block_size,
+    )
+    for block_hash in (first, second, stale):
+        assert tracker.register_chain([block_hash])
+        assert tracker.record_completed_access([block_hash])
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 4),
+        max_model_len=32,
+        enable_caching=True,
+        hash_block_size=block_size,
+        prefix_retention_tracker=tracker,
+    )
+    _insert_cached_blocks(
+        manager.block_pool,
+        {1: first, 2: first, 3: second},
+    )
+    snapshot = Mock(wraps=tracker.snapshot)
+    protected_hashes = Mock(wraps=tracker.protected_hashes)
+    monkeypatch.setattr(tracker, "snapshot", snapshot)
+    monkeypatch.setattr(tracker, "protected_hashes", protected_hashes)
+
+    request = make_request("snapshot", list(range(block_size)), block_size, sha256)
+    assert manager.allocate_slots(request, request.num_tokens) is not None
+
+    snapshot.assert_called_once()
+    assert len(snapshot.call_args.args[0]) == 2
+    assert set(snapshot.call_args.args[0]) == {first, second}
+    assert stale not in snapshot.call_args.args[0]
+    protected_hashes.assert_called_once()
+    assert set(protected_hashes.call_args.args[0].resident_hashes) == {
+        first,
+        second,
+    }
+
+
+def test_manager_lru_skips_retention_snapshot(monkeypatch):
+    block_size = 4
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 3),
+        max_model_len=32,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    resident_keys = Mock(side_effect=AssertionError("LRU must not inspect residents"))
+    snapshot = Mock(side_effect=AssertionError("LRU must not snapshot"))
+    protected_hashes = Mock(side_effect=AssertionError("LRU must not rank"))
+    monkeypatch.setattr(
+        manager.block_pool,
+        "get_resident_cached_hashes",
+        resident_keys,
+    )
+    monkeypatch.setattr(manager.prefix_retention_tracker, "snapshot", snapshot)
+    monkeypatch.setattr(
+        manager.prefix_retention_tracker,
+        "protected_hashes",
+        protected_hashes,
+    )
+
+    request = make_request("lru", list(range(block_size)), block_size, sha256)
+    assert manager.allocate_slots(request, request.num_tokens) is not None
+    resident_keys.assert_not_called()
+    snapshot.assert_not_called()
+    protected_hashes.assert_not_called()
+
+
+def test_manager_non_lru_fails_before_external_or_rejected_allocation(monkeypatch):
+    block_size = 4
+    tracker = PrefixRetentionTracker(
+        policy=PrefixRetentionPolicy.PREFIX_RECENCY,
+        budget_blocks=1,
+        hash_block_size=block_size,
+    )
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 2),
+        max_model_len=32,
+        enable_caching=True,
+        hash_block_size=block_size,
+        prefix_retention_tracker=tracker,
+    )
+    snapshot = Mock(wraps=tracker.snapshot)
+    get_new_blocks = Mock(wraps=manager.block_pool.get_new_blocks)
+    monkeypatch.setattr(tracker, "snapshot", snapshot)
+    monkeypatch.setattr(manager.block_pool, "get_new_blocks", get_new_blocks)
+    request = make_request("blocked", list(range(8)), block_size, sha256)
+
+    assert manager.allocate_slots(request, request.num_tokens) is None
+    snapshot.assert_not_called()
+    get_new_blocks.assert_not_called()
+    with pytest.raises(
+        ValueError,
+        match="unsupported_prefix_retention:kv_connector_or_offload",
+    ):
+        manager.allocate_slots(
+            request,
+            request.num_tokens,
+            num_external_computed_tokens=1,
+        )
+    snapshot.assert_not_called()
+    get_new_blocks.assert_not_called()
+
+
+def test_manager_recurplan_without_recurrence_uses_lru_fast_path(monkeypatch):
+    block_size = 4
+    resident = make_block_hash_with_group_id(BlockHash(b"resident"), 0)
+    other = make_block_hash_with_group_id(BlockHash(b"other"), 0)
+    tracker = PrefixRetentionTracker(
+        policy=PrefixRetentionPolicy.RECURPLAN,
+        budget_blocks=1,
+        hash_block_size=block_size,
+    )
+    assert tracker.register_chain([resident])
+    for _ in range(4):
+        assert tracker.record_completed_access([resident])
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 3),
+        max_model_len=32,
+        enable_caching=True,
+        hash_block_size=block_size,
+        prefix_retention_tracker=tracker,
+    )
+    _insert_cached_blocks(manager.block_pool, {1: resident, 2: other})
+    popleft_n = Mock(wraps=manager.block_pool.free_block_queue.popleft_n)
+    prefer = Mock(
+        wraps=manager.block_pool.free_block_queue.popleft_n_prefer_unprotected
+    )
+    monkeypatch.setattr(manager.block_pool.free_block_queue, "popleft_n", popleft_n)
+    monkeypatch.setattr(
+        manager.block_pool.free_block_queue,
+        "popleft_n_prefer_unprotected",
+        prefer,
+    )
+
+    request = make_request("no-recurrence", list(range(4)), block_size, sha256)
+    assert manager.allocate_slots(request, request.num_tokens) is not None
+
+    popleft_n.assert_called_once_with(1)
+    prefer.assert_not_called()
+
+
+def test_manager_successful_reset_invalidates_stale_retention(monkeypatch):
+    block_size = 4
+    resident = make_block_hash_with_group_id(BlockHash(b"resident"), 0)
+    other = make_block_hash_with_group_id(BlockHash(b"other"), 0)
+    tracker = PrefixRetentionTracker(
+        policy=PrefixRetentionPolicy.PREFIX_RECENCY,
+        budget_blocks=1,
+        hash_block_size=block_size,
+    )
+    assert tracker.register_chain([resident])
+    assert tracker.record_completed_access([resident])
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 3),
+        max_model_len=32,
+        enable_caching=True,
+        hash_block_size=block_size,
+        prefix_retention_tracker=tracker,
+    )
+    _insert_cached_blocks(manager.block_pool, {1: resident, 2: other})
+    stale_snapshot = tracker.snapshot([resident])
+
+    assert manager.reset_prefix_cache()
+    assert tracker.protected_hashes(stale_snapshot) == frozenset()
+    assert tracker.completed_ordinal == 0
+    _insert_cached_blocks(manager.block_pool, {1: resident, 2: other})
+    popleft_n = Mock(wraps=manager.block_pool.free_block_queue.popleft_n)
+    prefer = Mock(
+        wraps=manager.block_pool.free_block_queue.popleft_n_prefer_unprotected
+    )
+    monkeypatch.setattr(manager.block_pool.free_block_queue, "popleft_n", popleft_n)
+    monkeypatch.setattr(
+        manager.block_pool.free_block_queue,
+        "popleft_n_prefer_unprotected",
+        prefer,
+    )
+
+    request = make_request("after-reset", list(range(4)), block_size, sha256)
+    assert manager.allocate_slots(request, request.num_tokens) is not None
+    popleft_n.assert_called_once_with(1)
+    prefer.assert_not_called()
+
+
+def test_manager_failed_reset_preserves_retention_state():
+    block_size = 4
+    tracker = PrefixRetentionTracker(
+        policy=PrefixRetentionPolicy.PREFIX_RECENCY,
+        budget_blocks=1,
+        hash_block_size=block_size,
+    )
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 3),
+        max_model_len=32,
+        enable_caching=True,
+        hash_block_size=block_size,
+        prefix_retention_tracker=tracker,
+    )
+    request = make_request("in-use", list(range(4)), block_size, sha256)
+    assert manager.allocate_slots(request, request.num_tokens) is not None
+    resident_hash = manager.coordinator.get_blocks(request.request_id)[0][0].block_hash
+    assert resident_hash is not None
+    assert tracker.record_completed_access([resident_hash])
+    before = tracker.snapshot([resident_hash])
+
+    assert not manager.reset_prefix_cache()
+
+    after = tracker.snapshot([resident_hash])
+    assert after._generation == before._generation
+    assert after.completed_ordinal == before.completed_ordinal
+    assert after.metadata == before.metadata
+
+
 @pytest.mark.parametrize("blocks_to_cache", [2, 3, 10])
 def test_kv_cache_events(blocks_to_cache: int):
     block_size = 16

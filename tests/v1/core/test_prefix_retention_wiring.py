@@ -1,0 +1,530 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+import torch
+
+import vllm.v1.core.sched.scheduler as scheduler_module
+from vllm.config import CacheConfig
+from vllm.engine.arg_utils import EngineArgs
+from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.v1.core.prefix_retention import PrefixRetentionPolicy
+from vllm.v1.core.sched.scheduler import (
+    Scheduler,
+    _create_prefix_retention_tracker,
+)
+from vllm.v1.kv_cache_interface import (
+    CrossAttentionSpec,
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    MambaSpec,
+    SlidingWindowSpec,
+)
+
+pytestmark = pytest.mark.cpu_test
+
+
+def test_prefix_retention_cli_args():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    defaults = EngineArgs.from_cli_args(parser.parse_args([]))
+    configured = EngineArgs.from_cli_args(
+        parser.parse_args(
+            [
+                "--prefix-retention-policy",
+                "recurplan",
+                "--prefix-retention-budget-blocks",
+                "7",
+            ]
+        )
+    )
+
+    assert defaults.prefix_retention_policy == "lru"
+    assert defaults.prefix_retention_budget_blocks == 0
+    assert configured.prefix_retention_policy == "recurplan"
+    assert configured.prefix_retention_budget_blocks == 7
+
+
+def _make_gate_inputs(
+    *,
+    policy: str = "recurplan",
+    budget: int = 1,
+    num_blocks: int = 8,
+):
+    cache_config = SimpleNamespace(
+        prefix_retention_policy=policy,
+        prefix_retention_budget_blocks=budget,
+        enable_prefix_caching=True,
+        is_attention_free=False,
+        sliding_window=None,
+        kv_offloading_size=None,
+        block_size=4,
+        num_gpu_blocks=num_blocks,
+    )
+    model_config = SimpleNamespace(
+        is_attention_free=False,
+        is_hybrid=False,
+        is_encoder_decoder=False,
+    )
+    parallel_config = SimpleNamespace(
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        data_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        nnodes=1,
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=cache_config,
+        model_config=model_config,
+        parallel_config=parallel_config,
+        kv_transfer_config=None,
+        speculative_config=None,
+    )
+    group = SimpleNamespace(
+        kv_cache_spec=FullAttentionSpec(
+            block_size=4,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+        ),
+        is_eagle_group=False,
+    )
+    kv_cache_config = SimpleNamespace(
+        num_blocks=num_blocks,
+        kv_cache_groups=[group],
+    )
+    return vllm_config, kv_cache_config
+
+
+def _make_real_scheduler_inputs(
+    *,
+    policy: str = "recurplan",
+    budget: int = 2,
+    enable_prefix_caching: bool = True,
+):
+    num_blocks = 8
+    cache_config = CacheConfig(
+        block_size=4,
+        enable_prefix_caching=enable_prefix_caching,
+        prefix_retention_policy=policy,
+        prefix_retention_budget_blocks=budget,
+    )
+    cache_config.num_gpu_blocks = num_blocks
+    model_config = SimpleNamespace(
+        is_attention_free=False,
+        is_hybrid=False,
+        is_encoder_decoder=False,
+        max_model_len=32,
+        enable_return_routed_experts=False,
+    )
+    parallel_config = SimpleNamespace(
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        data_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        nnodes=1,
+        data_parallel_index=0,
+    )
+    scheduler_config = SimpleNamespace(
+        max_num_seqs=1,
+        max_num_scheduled_tokens=None,
+        max_num_batched_tokens=32,
+        policy="fcfs",
+        scheduler_reserve_full_isl=False,
+    )
+    vllm_config = SimpleNamespace(
+        scheduler_config=scheduler_config,
+        cache_config=cache_config,
+        lora_config=None,
+        kv_events_config=None,
+        parallel_config=parallel_config,
+        observability_config=SimpleNamespace(
+            kv_cache_metrics=None,
+            kv_cache_metrics_sample=1.0,
+            enable_mfu_metrics=False,
+        ),
+        model_config=model_config,
+        kv_transfer_config=None,
+        ec_transfer_config=None,
+        speculative_config=None,
+        use_v2_model_runner=False,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer"],
+                FullAttentionSpec(
+                    block_size=4,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            )
+        ],
+    )
+    return vllm_config, kv_cache_config
+
+
+@pytest.mark.parametrize(
+    ("policy", "budget"),
+    [
+        ("lru", 0),
+        ("prefix_recency", 2),
+        ("lfu", 2),
+        ("recurplan", 2),
+    ],
+)
+def test_capability_gate_builds_requested_tracker(policy: str, budget: int):
+    vllm_config, kv_cache_config = _make_gate_inputs(
+        policy=policy,
+        budget=budget,
+    )
+
+    tracker, hash_block_size = _create_prefix_retention_tracker(
+        vllm_config,
+        kv_cache_config,
+        block_size=4,
+        hash_block_size=None,
+    )
+
+    assert tracker.policy is PrefixRetentionPolicy(policy)
+    assert tracker.budget_blocks == budget
+    assert tracker.hash_block_size == hash_block_size == 4
+
+
+def test_real_scheduler_wires_one_tracker_to_manager_and_pool(monkeypatch):
+    vllm_config, kv_cache_config = _make_real_scheduler_inputs()
+    event_publisher = Mock()
+    monkeypatch.setattr(
+        scheduler_module.EventPublisherFactory,
+        "create",
+        Mock(return_value=event_publisher),
+    )
+    mm_registry = Mock()
+    mm_registry.supports_multimodal_inputs.return_value = False
+
+    scheduler = Scheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        structured_output_manager=Mock(),
+        block_size=4,
+        hash_block_size=4,
+        mm_registry=mm_registry,
+    )
+
+    tracker = scheduler.prefix_retention_tracker
+    assert tracker.policy is PrefixRetentionPolicy.RECURPLAN
+    assert tracker is scheduler.kv_cache_manager.prefix_retention_tracker
+    assert tracker is scheduler.kv_cache_manager.block_pool.prefix_retention_tracker
+
+
+def test_real_scheduler_invalid_gate_precedes_all_side_effect_factories(monkeypatch):
+    vllm_config, kv_cache_config = _make_real_scheduler_inputs(
+        enable_prefix_caching=False
+    )
+    tracker_factory = Mock()
+    connector_factory = Mock()
+    event_factory = Mock()
+    ec_factory = Mock()
+    manager_factory = Mock()
+    monkeypatch.setattr(scheduler_module, "PrefixRetentionTracker", tracker_factory)
+    monkeypatch.setattr(
+        scheduler_module.KVConnectorFactory,
+        "create_connector",
+        connector_factory,
+    )
+    monkeypatch.setattr(
+        scheduler_module.EventPublisherFactory,
+        "create",
+        event_factory,
+    )
+    monkeypatch.setattr(
+        scheduler_module.ECConnectorFactory,
+        "create_connector",
+        ec_factory,
+    )
+    monkeypatch.setattr(scheduler_module, "KVCacheManager", manager_factory)
+
+    with pytest.raises(ValueError, match="prefix_caching_disabled"):
+        Scheduler(
+            vllm_config=vllm_config,
+            kv_cache_config=kv_cache_config,
+            structured_output_manager=Mock(),
+            block_size=4,
+            hash_block_size=4,
+            mm_registry=Mock(),
+        )
+
+    tracker_factory.assert_not_called()
+    connector_factory.assert_not_called()
+    event_factory.assert_not_called()
+    ec_factory.assert_not_called()
+    manager_factory.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    [
+        ("prefix_disabled", "prefix_caching_disabled"),
+        ("attention_free", "attention_free"),
+        ("hybrid", "hybrid_model"),
+        ("encoder_decoder", "encoder_decoder"),
+        ("multiple_groups", "multiple_kv_groups"),
+        ("non_full", "non_full_attention"),
+        ("block_mask", "block_mask_capable"),
+        ("geometry", "block_geometry_mismatch"),
+        ("connector", "kv_connector_or_offload"),
+        ("speculative", "speculative_decode"),
+        ("distributed", "distributed_execution"),
+        ("budget", "invalid_budget"),
+    ],
+)
+def test_capability_gate_fails_closed(case: str, reason: str):
+    vllm_config, kv_cache_config = _make_gate_inputs()
+    cache = vllm_config.cache_config
+    model = vllm_config.model_config
+    parallel = vllm_config.parallel_config
+    if case == "prefix_disabled":
+        cache.enable_prefix_caching = False
+    elif case == "attention_free":
+        model.is_attention_free = True
+    elif case == "hybrid":
+        model.is_hybrid = True
+    elif case == "encoder_decoder":
+        model.is_encoder_decoder = True
+    elif case == "multiple_groups":
+        kv_cache_config.kv_cache_groups *= 2
+    elif case == "non_full":
+        kv_cache_config.kv_cache_groups[0].kv_cache_spec = object()
+    elif case == "block_mask":
+        cache.sliding_window = 8
+    elif case == "geometry":
+        cache.block_size = 8
+    elif case == "connector":
+        vllm_config.kv_transfer_config = object()
+    elif case == "speculative":
+        vllm_config.speculative_config = object()
+    elif case == "distributed":
+        parallel.tensor_parallel_size = 2
+    elif case == "budget":
+        cache.prefix_retention_budget_blocks = kv_cache_config.num_blocks
+    else:  # pragma: no cover
+        raise AssertionError(case)
+
+    with pytest.raises(ValueError, match=reason):
+        _create_prefix_retention_tracker(
+            vllm_config,
+            kv_cache_config,
+            block_size=4,
+            hash_block_size=4,
+        )
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        SlidingWindowSpec(
+            block_size=4,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            sliding_window=8,
+        ),
+        MambaSpec(
+            block_size=4,
+            shapes=(1, 1),
+            dtypes=(torch.float32,),
+        ),
+        CrossAttentionSpec(
+            block_size=4,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+        ),
+    ],
+    ids=("sliding_window", "mamba", "cross_attention"),
+)
+def test_capability_gate_rejects_real_non_full_attention_specs(spec):
+    vllm_config, kv_cache_config = _make_gate_inputs()
+    kv_cache_config.kv_cache_groups[0].kv_cache_spec = spec
+
+    with pytest.raises(ValueError, match="non_full_attention"):
+        _create_prefix_retention_tracker(
+            vllm_config,
+            kv_cache_config,
+            block_size=4,
+            hash_block_size=4,
+        )
+
+
+@pytest.mark.parametrize("field", ("sliding_window", "attention_chunk_size"))
+def test_capability_gate_rejects_real_block_mask_modes(field: str):
+    vllm_config, kv_cache_config = _make_gate_inputs()
+    kwargs = {field: 8}
+    kv_cache_config.kv_cache_groups[0].kv_cache_spec = FullAttentionSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        **kwargs,
+    )
+
+    with pytest.raises(ValueError, match="block_mask_capable"):
+        _create_prefix_retention_tracker(
+            vllm_config,
+            kv_cache_config,
+            block_size=4,
+            hash_block_size=4,
+        )
+
+
+@pytest.mark.parametrize("mode", ("connector", "offload"))
+def test_capability_gate_rejects_each_external_kv_path(mode: str):
+    vllm_config, kv_cache_config = _make_gate_inputs()
+    if mode == "connector":
+        vllm_config.kv_transfer_config = object()
+    else:
+        vllm_config.cache_config.kv_offloading_size = 1.0
+
+    with pytest.raises(ValueError, match="kv_connector_or_offload"):
+        _create_prefix_retention_tracker(
+            vllm_config,
+            kv_cache_config,
+            block_size=4,
+            hash_block_size=4,
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "data_parallel_size",
+        "prefill_context_parallel_size",
+        "decode_context_parallel_size",
+        "nnodes",
+    ),
+)
+def test_capability_gate_rejects_each_distributed_degree(field: str):
+    vllm_config, kv_cache_config = _make_gate_inputs()
+    setattr(vllm_config.parallel_config, field, 2)
+
+    with pytest.raises(ValueError, match="distributed_execution"):
+        _create_prefix_retention_tracker(
+            vllm_config,
+            kv_cache_config,
+            block_size=4,
+            hash_block_size=4,
+        )
+
+
+@pytest.mark.parametrize("case", ("spec", "cache", "scheduler", "hash"))
+def test_capability_gate_rejects_each_block_geometry_mismatch(case: str):
+    vllm_config, kv_cache_config = _make_gate_inputs()
+    scheduler_block_size = 4
+    hash_block_size = 4
+    if case == "spec":
+        kv_cache_config.kv_cache_groups[0].kv_cache_spec = FullAttentionSpec(
+            block_size=8,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+        )
+    elif case == "cache":
+        vllm_config.cache_config.block_size = 8
+    elif case == "scheduler":
+        scheduler_block_size = 8
+    elif case == "hash":
+        hash_block_size = 8
+
+    with pytest.raises(ValueError, match="block_geometry_mismatch"):
+        _create_prefix_retention_tracker(
+            vllm_config,
+            kv_cache_config,
+            block_size=scheduler_block_size,
+            hash_block_size=hash_block_size,
+        )
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("actual_none", "actual_one", "configured_none", "mismatch", "capacity"),
+)
+def test_capability_gate_rejects_each_invalid_budget_boundary(case: str):
+    vllm_config, kv_cache_config = _make_gate_inputs()
+    if case == "actual_none":
+        kv_cache_config.num_blocks = None
+    elif case == "actual_one":
+        kv_cache_config.num_blocks = 1
+        vllm_config.cache_config.num_gpu_blocks = 1
+    elif case == "configured_none":
+        vllm_config.cache_config.num_gpu_blocks = None
+    elif case == "mismatch":
+        vllm_config.cache_config.num_gpu_blocks = 7
+    elif case == "capacity":
+        vllm_config.cache_config.prefix_retention_budget_blocks = 8
+
+    with pytest.raises(ValueError, match="invalid_budget"):
+        _create_prefix_retention_tracker(
+            vllm_config,
+            kv_cache_config,
+            block_size=4,
+            hash_block_size=4,
+        )
+
+
+def test_capability_gate_rejects_eagle_group_without_speculative_config():
+    vllm_config, kv_cache_config = _make_gate_inputs()
+    kv_cache_config.kv_cache_groups[0].is_eagle_group = True
+
+    with pytest.raises(ValueError, match="speculative_decode"):
+        _create_prefix_retention_tracker(
+            vllm_config,
+            kv_cache_config,
+            block_size=4,
+            hash_block_size=4,
+        )
+
+
+def test_lru_bypasses_experimental_capability_envelope():
+    vllm_config, kv_cache_config = _make_gate_inputs(policy="lru", budget=0)
+    vllm_config.cache_config.enable_prefix_caching = False
+    vllm_config.model_config.is_hybrid = True
+    vllm_config.parallel_config.tensor_parallel_size = 2
+    kv_cache_config.kv_cache_groups *= 2
+
+    tracker, _ = _create_prefix_retention_tracker(
+        vllm_config,
+        kv_cache_config,
+        block_size=4,
+        hash_block_size=4,
+    )
+
+    assert tracker.policy is PrefixRetentionPolicy.LRU
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"prefix_retention_policy": "lru", "prefix_retention_budget_blocks": 1},
+        {
+            "prefix_retention_policy": "recurplan",
+            "prefix_retention_budget_blocks": 0,
+        },
+        {
+            "prefix_retention_policy": "recurplan",
+            "prefix_retention_budget_blocks": -1,
+        },
+    ],
+)
+def test_cache_config_rejects_invalid_policy_budget_pairs(kwargs):
+    with pytest.raises(ValueError, match="invalid_budget"):
+        CacheConfig(**kwargs)

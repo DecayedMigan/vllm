@@ -36,6 +36,7 @@ CacheDType = Literal[
 MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
+PrefixRetentionPolicyName = Literal["lru", "prefix_recency", "lfu", "recurplan"]
 KVOffloadingBackend = Literal["native", "lmcache"]
 
 
@@ -107,6 +108,10 @@ class CacheConfig:
       security risk tolerance against the performance benefits before turning this on.
     - "xxhash_cbor" combines canonical CBOR serialization with xxHash for
       reproducible hashing. Requires the optional ``xxhash`` package."""
+    prefix_retention_policy: PrefixRetentionPolicyName = "lru"
+    """Advisory policy used to retain reusable cached prefixes under pressure."""
+    prefix_retention_budget_blocks: int = 0
+    """Maximum number of resident blocks advisory retention may protect."""
     calculate_kv_scales: bool = False
     """Deprecated: This option is deprecated and will be removed in v0.19.
     It enables dynamic calculation of `k_scale` and `v_scale` when
@@ -195,6 +200,8 @@ class CacheConfig:
             "num_gpu_blocks_override",
             "enable_prefix_caching",
             "prefix_caching_hash_algo",
+            "prefix_retention_policy",
+            "prefix_retention_budget_blocks",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "hash_block_size",
             "mamba_page_size_padded",
@@ -242,6 +249,27 @@ class CacheConfig:
         if self.mamba_block_size is not None:
             self.user_specified_mamba_block_size = True
         return self
+
+    @model_validator(mode="after")
+    def _validate_prefix_retention(self) -> "CacheConfig":
+        if self.prefix_retention_policy == "lru":
+            if self.prefix_retention_budget_blocks != 0:
+                raise ValueError(
+                    "invalid_budget: prefix_retention_budget_blocks must be 0 for lru"
+                )
+        elif self.prefix_retention_budget_blocks == 0:
+            raise ValueError(
+                "invalid_budget: prefix_retention_budget_blocks must be positive "
+                "for non-lru policies"
+            )
+        return self
+
+    @field_validator("prefix_retention_budget_blocks", mode="before")
+    @classmethod
+    def _validate_prefix_retention_budget_type(cls, value: Any) -> int:
+        if type(value) is not int or value < 0:
+            raise ValueError("invalid_budget")
+        return value
 
     @field_validator("calculate_kv_scales", mode="after")
     @classmethod

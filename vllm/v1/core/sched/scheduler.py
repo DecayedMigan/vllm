@@ -36,6 +36,10 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.prefix_retention import (
+    PrefixRetentionPolicy,
+    PrefixRetentionTracker,
+)
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -50,7 +54,7 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -60,6 +64,103 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _create_prefix_retention_tracker(
+    vllm_config: VllmConfig,
+    kv_cache_config: KVCacheConfig,
+    block_size: int,
+    hash_block_size: int | None,
+) -> tuple[PrefixRetentionTracker, int]:
+    """Validate the experimental retention envelope before side effects."""
+    cache_config = vllm_config.cache_config
+    policy = PrefixRetentionPolicy(cache_config.prefix_retention_policy)
+    budget = cache_config.prefix_retention_budget_blocks
+    effective_hash_block_size = (
+        block_size if hash_block_size is None else hash_block_size
+    )
+
+    if policy is not PrefixRetentionPolicy.LRU:
+        model_config = vllm_config.model_config
+        parallel_config = vllm_config.parallel_config
+        groups = kv_cache_config.kv_cache_groups
+        reasons: list[str] = []
+
+        if cache_config.enable_prefix_caching is not True:
+            reasons.append("prefix_caching_disabled")
+        if model_config.is_attention_free or cache_config.is_attention_free:
+            reasons.append("attention_free")
+        if model_config.is_hybrid:
+            reasons.append("hybrid_model")
+        if model_config.is_encoder_decoder:
+            reasons.append("encoder_decoder")
+        if len(groups) != 1:
+            reasons.append("multiple_kv_groups")
+
+        spec = groups[0].kv_cache_spec if len(groups) == 1 else None
+        if spec is not None:
+            if type(spec) is not FullAttentionSpec:
+                reasons.append("non_full_attention")
+            else:
+                if (
+                    spec.sliding_window is not None
+                    or spec.attention_chunk_size is not None
+                    or cache_config.sliding_window is not None
+                ):
+                    reasons.append("block_mask_capable")
+                if not (
+                    spec.block_size
+                    == cache_config.block_size
+                    == block_size
+                    == effective_hash_block_size
+                ):
+                    reasons.append("block_geometry_mismatch")
+
+        if (
+            vllm_config.kv_transfer_config is not None
+            or cache_config.kv_offloading_size is not None
+        ):
+            reasons.append("kv_connector_or_offload")
+        if vllm_config.speculative_config is not None or any(
+            group.is_eagle_group for group in groups
+        ):
+            reasons.append("speculative_decode")
+        if any(
+            world_size != 1
+            for world_size in (
+                parallel_config.tensor_parallel_size,
+                parallel_config.pipeline_parallel_size,
+                parallel_config.data_parallel_size,
+                parallel_config.prefill_context_parallel_size,
+                parallel_config.decode_context_parallel_size,
+                parallel_config.nnodes,
+            )
+        ):
+            reasons.append("distributed_execution")
+
+        actual_blocks = kv_cache_config.num_blocks
+        configured_blocks = cache_config.num_gpu_blocks
+        if (
+            budget <= 0
+            or type(actual_blocks) is not int
+            or actual_blocks <= 1
+            or type(configured_blocks) is not int
+            or configured_blocks != actual_blocks
+            or budget > actual_blocks - 1
+        ):
+            reasons.append("invalid_budget")
+
+        if reasons:
+            raise ValueError("unsupported_prefix_retention:" + ",".join(reasons))
+
+    return (
+        PrefixRetentionTracker(
+            policy=policy,
+            budget_blocks=budget,
+            hash_block_size=effective_hash_block_size,
+        ),
+        effective_hash_block_size,
+    )
 
 
 class Scheduler(SchedulerInterface):
@@ -111,6 +212,15 @@ class Scheduler(SchedulerInterface):
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
             and self.kv_events_config.enable_kv_cache_events
+        )
+        (
+            self.prefix_retention_tracker,
+            effective_hash_block_size,
+        ) = _create_prefix_retention_tracker(
+            vllm_config,
+            kv_cache_config,
+            block_size,
+            hash_block_size,
         )
 
         # Create KVConnector for the Scheduler. Note that each Worker
@@ -226,8 +336,6 @@ class Scheduler(SchedulerInterface):
                 self.num_lookahead_tokens = self.num_spec_tokens + 1
 
         # Create the KV cache manager.
-        if hash_block_size is None:
-            hash_block_size = block_size
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -239,8 +347,9 @@ class Scheduler(SchedulerInterface):
             dcp_world_size=self.dcp_world_size,
             pcp_world_size=self.pcp_world_size,
             scheduler_block_size=self.block_size,
-            hash_block_size=hash_block_size,
+            hash_block_size=effective_hash_block_size,
             metrics_collector=self.kv_metrics_collector,
+            prefix_retention_tracker=self.prefix_retention_tracker,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.

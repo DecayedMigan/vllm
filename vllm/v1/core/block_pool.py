@@ -125,6 +125,10 @@ class BlockHashToBlockMap:
     def __len__(self) -> int:
         return len(self._cache)
 
+    def resident_keys(self) -> tuple[BlockHashWithGroupId, ...]:
+        """Return a read-only, unique snapshot of live group-aware keys."""
+        return tuple(self._cache)
+
     def _unexpected_blocks_type(self, blocks: Any) -> None:
         raise AssertionError(f"Invalid KV cache block type {type(blocks)}")
 
@@ -212,6 +216,10 @@ class BlockPool:
                 return None
             cached_blocks.append(block)
         return cached_blocks
+
+    def get_resident_cached_hashes(self) -> tuple[BlockHashWithGroupId, ...]:
+        """Return a unique, group-aware snapshot without exposing the map."""
+        return self.cached_block_hash_to_block.resident_keys()
 
     def cache_full_blocks(
         self,

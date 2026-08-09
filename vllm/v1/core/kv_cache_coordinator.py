@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from collections.abc import Set as AbstractSet
 from typing import NamedTuple
 
 from vllm import envs
@@ -11,6 +12,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashList,
     BlockHashListWithBlockSize,
+    BlockHashWithGroupId,
     KVCacheBlock,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
@@ -215,6 +217,8 @@ class KVCacheCoordinator(ABC):
         num_tokens: int,
         num_tokens_main_model: int,
         num_encoder_tokens: int = 0,
+        *,
+        protected_hashes: AbstractSet[BlockHashWithGroupId] | None = None,
     ) -> tuple[list[KVCacheBlock], ...]:
         """
         Allocate new blocks for the request to give it at least `num_tokens`
@@ -240,6 +244,7 @@ class KVCacheCoordinator(ABC):
                 if isinstance(manager, CrossAttentionManager)
                 else num_tokens,
                 num_tokens_main_model,
+                protected_hashes=protected_hashes,
             )
             for manager in self.single_type_managers
         )

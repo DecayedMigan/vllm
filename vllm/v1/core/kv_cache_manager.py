@@ -129,6 +129,7 @@ class KVCacheManager:
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        prefix_retention_tracker: PrefixRetentionTracker | None = None,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -161,10 +162,12 @@ class KVCacheManager:
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
-        self.prefix_retention_tracker = PrefixRetentionTracker(
-            policy=PrefixRetentionPolicy.LRU,
-            budget_blocks=0,
-            hash_block_size=hash_block_size,
+        self.prefix_retention_tracker = prefix_retention_tracker or (
+            PrefixRetentionTracker(
+                policy=PrefixRetentionPolicy.LRU,
+                budget_blocks=0,
+                hash_block_size=hash_block_size,
+            )
         )
         self.block_pool.prefix_retention_tracker = self.prefix_retention_tracker
         self.kv_cache_config = kv_cache_config
@@ -342,6 +345,10 @@ class KVCacheManager:
                 "num_new_tokens must be greater than 0 when there are no "
                 "external computed tokens"
             )
+        if self.prefix_retention_tracker.policy is not PrefixRetentionPolicy.LRU and (
+            num_external_computed_tokens > 0 or delay_cache_blocks
+        ):
+            raise ValueError("unsupported_prefix_retention:kv_connector_or_offload")
 
         if new_computed_blocks is not None:
             new_computed_block_list = new_computed_blocks.blocks
@@ -416,11 +423,21 @@ class KVCacheManager:
                 num_external_computed_tokens=num_external_computed_tokens,
             )
 
+        protected_hashes = None
+        if (
+            num_blocks_to_allocate > 0
+            and self.prefix_retention_tracker.policy is not PrefixRetentionPolicy.LRU
+        ):
+            resident_hashes = self.block_pool.get_resident_cached_hashes()
+            snapshot = self.prefix_retention_tracker.snapshot(resident_hashes)
+            protected_hashes = self.prefix_retention_tracker.protected_hashes(snapshot)
+
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id,
             num_tokens_need_slot,
             num_tokens_main_model,
             num_encoder_tokens,
+            protected_hashes=protected_hashes,
         )
 
         # P/D: delay caching blocks if we have to recv from
