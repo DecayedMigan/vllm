@@ -455,10 +455,17 @@ class KVCacheManager:
         """Record one successfully completed request without freeing blocks."""
         if self.num_kv_cache_groups != 1:
             return False
-        chain = tuple(
-            make_block_hash_with_group_id(block_hash, 0)
-            for block_hash in request.block_hashes
-        )
+
+        chain = []
+        for i, block in enumerate(self.coordinator.get_blocks(request.request_id)[0]):
+            if block.is_null or block.block_hash is None:
+                break
+            if i >= len(request.block_hashes):
+                return False
+            expected_hash = make_block_hash_with_group_id(request.block_hashes[i], 0)
+            if block.block_hash != expected_hash:
+                return False
+            chain.append(block.block_hash)
         return self.prefix_retention_tracker.record_completed_access(chain)
 
     def remove_skipped_blocks(

@@ -38,6 +38,7 @@ from vllm.v1.core.prefix_retention import (
     PrefixRetentionPolicy,
     PrefixRetentionTracker,
 )
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -47,6 +48,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowSpec,
 )
+from vllm.v1.request import RequestStatus
 
 pytestmark = pytest.mark.cpu_test
 
@@ -1526,6 +1528,123 @@ def test_noncompletion_manager_paths_do_not_record_completed_access():
 
     record_completed_access.assert_not_called()
     assert manager.prefix_retention_tracker.completed_ordinal == 0
+
+
+@pytest.mark.parametrize(
+    ("finished_status", "connector_delays_free"),
+    [
+        (RequestStatus.FINISHED_STOPPED, False),
+        (RequestStatus.FINISHED_LENGTH_CAPPED, True),
+    ],
+)
+def test_completed_access_uses_current_contiguous_hashed_physical_chain(
+    finished_status: RequestStatus, connector_delays_free: bool
+):
+    block_size = 4
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 4),
+        max_model_len=32,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    token_ids = list(range(12))
+    old_request = make_request("old", token_ids, block_size, sha256)
+    old_blocks = manager.allocate_slots(old_request, old_request.num_tokens)
+    assert old_blocks is not None
+    full_chain = tuple(
+        make_block_hash_with_group_id(block_hash, 0)
+        for block_hash in old_request.block_hashes
+    )
+    assert len(full_chain) == 3
+    assert len(manager.prefix_retention_tracker.snapshot(full_chain).metadata) == 3
+    old_block_ids = set(old_blocks.get_block_ids()[0])
+    manager.free(old_request)
+    manager.evict_blocks(old_block_ids)
+
+    request = make_request("current", token_ids, block_size, sha256)
+    blocks = manager.allocate_slots(
+        request, request.num_tokens, delay_cache_blocks=True
+    )
+    assert blocks is not None
+    manager.cache_blocks(request, num_computed_tokens=2 * block_size)
+    physical_blocks = manager.coordinator.get_blocks(request.request_id)[0]
+    assert len(request.block_hashes) == len(physical_blocks) == 3
+    assert all(block.block_hash is not None for block in physical_blocks[:2])
+    assert physical_blocks[2].block_hash is None
+
+    request.status = finished_status
+    scheduler = object.__new__(Scheduler)
+    scheduler.kv_cache_manager = manager
+    scheduler.encoder_cache_manager = Mock()
+    scheduler.finished_req_ids = set()
+    scheduler.finished_req_ids_dict = None
+    scheduler.requests = {request.request_id: request}
+    scheduler._connector_finished = Mock(return_value=(connector_delays_free, None))
+
+    scheduler._free_request(request)
+
+    snapshot = manager.prefix_retention_tracker.snapshot(full_chain)
+    metadata = {item.block_hash: item for item in snapshot.metadata}
+    assert snapshot.completed_ordinal == 1
+    assert [metadata[key].completed_count for key in full_chain] == [1, 1, 0]
+    assert [metadata[key].last_access_ordinal for key in full_chain] == [1, 1, 0]
+    if connector_delays_free:
+        assert manager.coordinator.get_blocks(request.request_id)[0]
+        scheduler._free_blocks(request)
+        assert manager.prefix_retention_tracker.completed_ordinal == 1
+    assert not manager.coordinator.get_blocks(request.request_id)[0]
+    assert request.request_id not in scheduler.requests
+
+
+def test_completed_access_fails_closed_for_unhashed_or_mismatched_physical_chain():
+    block_size = 4
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 4),
+        max_model_len=32,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    token_ids = list(range(12))
+    old_request = make_request("old", token_ids, block_size, sha256)
+    old_blocks = manager.allocate_slots(old_request, old_request.num_tokens)
+    assert old_blocks is not None
+    full_chain = tuple(
+        make_block_hash_with_group_id(block_hash, 0)
+        for block_hash in old_request.block_hashes
+    )
+    old_block_ids = set(old_blocks.get_block_ids()[0])
+    manager.free(old_request)
+    manager.evict_blocks(old_block_ids)
+
+    unhashed = make_request("unhashed", token_ids, block_size, sha256)
+    assert (
+        manager.allocate_slots(unhashed, unhashed.num_tokens, delay_cache_blocks=True)
+        is not None
+    )
+    assert not manager.record_completed_request_access(unhashed)
+    assert manager.prefix_retention_tracker.completed_ordinal == 0
+    manager.free(unhashed)
+
+    physical_request = make_request("mismatch", token_ids, block_size, sha256)
+    assert (
+        manager.allocate_slots(
+            physical_request,
+            physical_request.num_tokens,
+            delay_cache_blocks=True,
+        )
+        is not None
+    )
+    manager.cache_blocks(physical_request, num_computed_tokens=2 * block_size)
+    mismatched_request = make_request(
+        physical_request.request_id,
+        [99] * len(token_ids),
+        block_size,
+        sha256,
+    )
+    assert not manager.record_completed_request_access(mismatched_request)
+    snapshot = manager.prefix_retention_tracker.snapshot(full_chain)
+    assert snapshot.completed_ordinal == 0
+    assert {item.completed_count for item in snapshot.metadata} == {0}
 
 
 def test_cache_blocks_multi_group():

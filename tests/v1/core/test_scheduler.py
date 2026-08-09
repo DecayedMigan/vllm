@@ -78,6 +78,8 @@ def test_finish_request():
         (RequestStatus.FINISHED_LENGTH_CAPPED, 1, True),
         (RequestStatus.FINISHED_ABORTED, 0, False),
         (RequestStatus.FINISHED_ERROR, 0, False),
+        (RequestStatus.FINISHED_IGNORED, 0, False),
+        (RequestStatus.FINISHED_REPETITION, 0, False),
     ],
 )
 def test_completed_access_is_recorded_only_for_successful_finishes(
