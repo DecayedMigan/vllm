@@ -98,17 +98,16 @@ class PrefixRetentionTracker:
         if not block_hashes:
             return False
 
+        distinct_hashes = tuple(dict.fromkeys(block_hashes))
         parent: BlockHashWithGroupId | None = None
-        seen: set[BlockHashWithGroupId] = set()
-        for key in block_hashes:
+        for key in distinct_hashes:
             metadata = self._metadata.get(key)
-            if metadata is None or metadata.parent != parent or key in seen:
+            if metadata is None or metadata.parent != parent:
                 return False
-            seen.add(key)
             parent = key
 
         ordinal = self.completed_ordinal + 1
-        for key in block_hashes:
+        for key in distinct_hashes:
             metadata = self._metadata[key]
             if metadata.last_access_ordinal:
                 gap = ordinal - metadata.last_access_ordinal

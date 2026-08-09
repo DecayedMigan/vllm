@@ -128,6 +128,22 @@ def test_lfu_prefers_count_before_recency():
     assert tracker.protected_hashes(tracker.snapshot([frequent, recent])) == {frequent}
 
 
+def test_completed_access_deduplicates_identities_before_atomic_validation():
+    root, child, unknown = _hash(b"a"), _hash(b"b"), _hash(b"x")
+    tracker = _tracker(PrefixRetentionPolicy.LFU, budget=2)
+    assert tracker.register_chain([root, child])
+
+    assert tracker.record_completed_access([root, child, child])
+    snapshot = tracker.snapshot([root, child])
+    metadata = {item.block_hash: item for item in snapshot.metadata}
+    assert snapshot.completed_ordinal == 1
+    assert metadata[root].completed_count == 1
+    assert metadata[child].completed_count == 1
+
+    assert not tracker.record_completed_access([root, unknown, child, child])
+    assert tracker.snapshot([root, child]) == snapshot
+
+
 def test_recurplan_uses_frozen_ordinal_gap_score():
     periodic, early = _hash(b"a"), _hash(b"b")
     filler = _hash(b"z")
@@ -186,6 +202,75 @@ def test_recurplan_even_median_is_deterministic():
     assert tracker.protected_hashes(tracker.snapshot([even_median, competitor])) == {
         even_median
     }
+
+
+def _assert_recurplan_exact_tie_selects(
+    expected: BlockHashWithGroupId, other: BlockHashWithGroupId
+) -> None:
+    root, filler = _hash(b"r"), _hash(b"z")
+    tracker = _tracker(PrefixRetentionPolicy.RECURPLAN, budget=2)
+    assert tracker.register_chain([root, expected])
+    assert tracker.register_chain([root, other])
+    assert tracker.register_chain([filler])
+
+    # expected: gaps 3, 3, 3 and age 3. other: gaps 1, 2, 1 and
+    # age 1. Both timing scores are exactly one. The root is selected first;
+    # both children then have equal value and equal marginal cost one.
+    for key in (
+        expected,
+        filler,
+        filler,
+        expected,
+        filler,
+        filler,
+        expected,
+        other,
+        other,
+        expected,
+        other,
+        other,
+        filler,
+    ):
+        chain = [key] if key == filler else [root, key]
+        assert tracker.record_completed_access(chain)
+
+    assert tracker.protected_hashes(tracker.snapshot([other, root, expected])) == {
+        root,
+        expected,
+    }
+
+
+def test_recurplan_exact_ties_use_raw_digest_then_group_id():
+    _assert_recurplan_exact_tie_selects(_hash(b"a", 9), _hash(b"b", 0))
+    _assert_recurplan_exact_tie_selects(_hash(b"c", 1), _hash(b"c", 2))
+
+
+def test_recurplan_uses_only_the_latest_four_positive_gaps():
+    windowed, competitor, filler = _hash(b"a"), _hash(b"b"), _hash(b"z")
+    tracker = _tracker(PrefixRetentionPolicy.RECURPLAN, budget=1)
+    for key in (windowed, competitor, filler):
+        assert tracker.register_chain([key])
+
+    # windowed has five gaps 100, 1, 2, 3, 4. Keeping only the latest four
+    # yields median 5/2 and score 4/5 at age 2. Keeping all five would yield
+    # median 3 and score 2/3. competitor has score 3/4, so the winner locks
+    # both the four-gap window and its resulting exact timing score.
+    windowed_ordinals = {1, 101, 102, 104, 107, 111}
+    competitor_ordinals = {98, 99, 103, 110}
+    for ordinal in range(1, 114):
+        if ordinal in windowed_ordinals:
+            key = windowed
+        elif ordinal in competitor_ordinals:
+            key = competitor
+        else:
+            key = filler
+        assert tracker.record_completed_access([key])
+
+    snapshot = tracker.snapshot([windowed, competitor])
+    metadata = {item.block_hash: item for item in snapshot.metadata}
+    assert metadata[windowed].gaps == (1, 2, 3, 4)
+    assert all(len(item.gaps) <= 4 for item in snapshot.metadata)
+    assert tracker.protected_hashes(snapshot) == {windowed}
 
 
 @pytest.mark.parametrize(
