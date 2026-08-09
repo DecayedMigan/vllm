@@ -10,7 +10,14 @@ from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlock,
+    make_block_hash_with_group_id,
+)
+from vllm.v1.core.prefix_retention import (
+    PrefixRetentionPolicy,
+    PrefixRetentionTracker,
+)
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     get_kv_cache_spec_kind,
@@ -154,6 +161,12 @@ class KVCacheManager:
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
+        self.prefix_retention_tracker = PrefixRetentionTracker(
+            policy=PrefixRetentionPolicy.LRU,
+            budget_blocks=0,
+            hash_block_size=hash_block_size,
+        )
+        self.block_pool.prefix_retention_tracker = self.prefix_retention_tracker
         self.kv_cache_config = kv_cache_config
         self.kv_cache_event_metadata = tuple(
             (
@@ -438,6 +451,16 @@ class KVCacheManager:
         """
         self.coordinator.free(request.request_id)
 
+    def record_completed_request_access(self, request: Request) -> bool:
+        """Record one successfully completed request without freeing blocks."""
+        if self.num_kv_cache_groups != 1:
+            return False
+        chain = tuple(
+            make_block_hash_with_group_id(block_hash, 0)
+            for block_hash in request.block_hashes
+        )
+        return self.prefix_retention_tracker.record_completed_access(chain)
+
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int
     ) -> None:
@@ -470,6 +493,7 @@ class KVCacheManager:
         """
         if not self.block_pool.reset_prefix_cache():
             return False
+        self.prefix_retention_tracker.reset()
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.reset = True

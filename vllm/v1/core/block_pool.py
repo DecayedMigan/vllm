@@ -26,6 +26,7 @@ from vllm.v1.core.kv_cache_utils import (
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
 )
+from vllm.v1.core.prefix_retention import PrefixRetentionTracker
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -144,6 +145,7 @@ class BlockPool:
             actual block size can be a multiple of hash_block_size.
         enable_kv_cache_events: Whether to enable kv cache events.
         metrics_collector: Optional metrics collector for tracking block residency.
+        prefix_retention_tracker: Optional stable-hash retention metadata tracker.
     """
 
     def __init__(
@@ -153,6 +155,7 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        prefix_retention_tracker: PrefixRetentionTracker | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -180,6 +183,7 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        self.prefix_retention_tracker = prefix_retention_tracker
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -281,6 +285,17 @@ class BlockPool:
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
+
+        if self.prefix_retention_tracker is not None:
+            chain = tuple(
+                make_block_hash_with_group_id(block_hash, kv_cache_group_id)
+                for block_hash in block_hashes[:num_full_blocks]
+            )
+            if all(
+                block.block_hash == block_hash
+                for block, block_hash in zip(blocks[:num_full_blocks], chain)
+            ):
+                self.prefix_retention_tracker.register_chain(chain)
 
         if self.enable_kv_cache_events:
             if num_cached_blocks == 0:

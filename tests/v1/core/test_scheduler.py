@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 import torch
@@ -23,7 +23,15 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
-from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.kv_cache_utils import (
+    get_request_block_hasher,
+    init_none_hash,
+    make_block_hash_with_group_id,
+)
+from vllm.v1.core.prefix_retention import (
+    PrefixRetentionPolicy,
+    PrefixRetentionTracker,
+)
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import FinishReason
@@ -61,6 +69,98 @@ def test_finish_request():
         scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         assert request.request_id not in scheduler.requests
         assert len(scheduler.waiting) == 9 - i
+
+
+@pytest.mark.parametrize(
+    ("finished_status", "expected_completed_ordinal", "connector_delays_free"),
+    [
+        (RequestStatus.FINISHED_STOPPED, 1, False),
+        (RequestStatus.FINISHED_LENGTH_CAPPED, 1, True),
+        (RequestStatus.FINISHED_ABORTED, 0, False),
+        (RequestStatus.FINISHED_ERROR, 0, False),
+    ],
+)
+def test_completed_access_is_recorded_only_for_successful_finishes(
+    finished_status: RequestStatus,
+    expected_completed_ordinal: int,
+    connector_delays_free: bool,
+):
+    (request,) = create_requests(num_requests=1, num_tokens=32)
+    request.status = finished_status
+    chain = tuple(
+        make_block_hash_with_group_id(block_hash, 0)
+        for block_hash in request.block_hashes
+    )
+    tracker = PrefixRetentionTracker(
+        policy=PrefixRetentionPolicy.LRU,
+        budget_blocks=0,
+        hash_block_size=16,
+    )
+    assert tracker.register_chain(chain)
+    events = []
+    record_completed_access = Mock(
+        side_effect=lambda completed_request: (
+            events.append("record"),
+            tracker.record_completed_access(chain),
+        )[1]
+    )
+    manager = Mock(record_completed_request_access=record_completed_access)
+    manager.free.side_effect = lambda completed_request: events.append("free")
+    scheduler = object.__new__(Scheduler)
+    scheduler.kv_cache_manager = manager
+    scheduler.encoder_cache_manager = Mock()
+    scheduler.finished_req_ids = set()
+    scheduler.finished_req_ids_dict = None
+    scheduler.requests = {request.request_id: request}
+    scheduler._connector_finished = Mock(
+        side_effect=lambda completed_request: (
+            events.append("connector"),
+            (connector_delays_free, None),
+        )[1]
+    )
+
+    scheduler._free_request(request)
+
+    assert tracker.completed_ordinal == expected_completed_ordinal
+    expected_events = ["record"] if expected_completed_ordinal else []
+    expected_events.append("connector")
+    if not connector_delays_free:
+        expected_events.append("free")
+    assert events == expected_events
+    if expected_completed_ordinal:
+        record_completed_access.assert_called_once_with(request)
+        snapshot = tracker.snapshot(chain)
+        assert {item.completed_count for item in snapshot.metadata} == {1}
+        assert {item.last_access_ordinal for item in snapshot.metadata} == {1}
+    else:
+        record_completed_access.assert_not_called()
+    assert (request.request_id in scheduler.requests) is connector_delays_free
+
+
+def test_noncompletion_kv_paths_do_not_record_completed_access():
+    preempted, remote_failure = create_requests(
+        num_requests=2,
+        req_ids=["preempted", "remote-failure"],
+    )
+    preempted.status = RequestStatus.RUNNING
+    manager = Mock()
+    scheduler = object.__new__(Scheduler)
+    scheduler.kv_cache_manager = manager
+    scheduler.encoder_cache_manager = Mock()
+    scheduler.waiting = Mock()
+    scheduler.log_stats = False
+    scheduler._preempt_request(preempted, timestamp=0.0)
+
+    scheduler.connector = object()
+    scheduler.failed_recving_kv_req_ids = set()
+    scheduler.finished_recving_kv_req_ids = set()
+    remote_failure.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler.failed_recving_kv_req_ids.add(remote_failure.request_id)
+    scheduler.finished_recving_kv_req_ids.add(remote_failure.request_id)
+    scheduler._update_waiting_for_remote_kv(remote_failure)
+
+    manager.record_completed_request_access.assert_not_called()
+    assert manager.free.call_args_list == [call(preempted), call(remote_failure)]
 
 
 def test_get_num_unfinished_requests():

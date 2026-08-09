@@ -5,6 +5,7 @@
 import copy
 from collections.abc import Callable
 from math import lcm
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -32,6 +33,10 @@ from vllm.v1.core.kv_cache_utils import (
     hash_block_tokens,
     init_none_hash,
     make_block_hash_with_group_id,
+)
+from vllm.v1.core.prefix_retention import (
+    PrefixRetentionPolicy,
+    PrefixRetentionTracker,
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -1454,6 +1459,75 @@ def test_cache_blocks(hash_fn):
     assert blocks[0].block_hash is not None
 
 
+def test_cache_full_blocks_registers_complete_ordered_parent_chain():
+    block_size = 4
+    kv_cache_group_id = 7
+    tracker = PrefixRetentionTracker(
+        policy=PrefixRetentionPolicy.LRU,
+        budget_blocks=0,
+        hash_block_size=block_size,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=5,
+        enable_caching=True,
+        hash_block_size=block_size,
+        prefix_retention_tracker=tracker,
+    )
+    request = make_request("retention", list(range(12)), block_size, sha256)
+    blocks = [KVCacheBlock(block_id=i) for i in range(3)]
+
+    block_pool.cache_full_blocks(
+        request=request,
+        blocks=blocks,
+        num_cached_blocks=0,
+        num_full_blocks=2,
+        block_size=block_size,
+        kv_cache_group_id=kv_cache_group_id,
+    )
+    block_pool.cache_full_blocks(
+        request=request,
+        blocks=blocks,
+        num_cached_blocks=2,
+        num_full_blocks=3,
+        block_size=block_size,
+        kv_cache_group_id=kv_cache_group_id,
+    )
+
+    expected_chain = tuple(
+        make_block_hash_with_group_id(request.block_hashes[i], kv_cache_group_id)
+        for i in range(3)
+    )
+    snapshot = tracker.snapshot(expected_chain)
+    parents = {item.block_hash: item.parent for item in snapshot.metadata}
+    assert parents == {
+        expected_chain[0]: None,
+        expected_chain[1]: expected_chain[0],
+        expected_chain[2]: expected_chain[1],
+    }
+
+
+def test_noncompletion_manager_paths_do_not_record_completed_access():
+    block_size = 4
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 1),
+        max_model_len=32,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    request = make_request("noncompletion", list(range(8)), block_size, sha256)
+    record_completed_access = Mock(wraps=manager.record_completed_request_access)
+    manager.record_completed_request_access = record_completed_access
+
+    computed_blocks, num_computed_tokens = manager.get_computed_blocks(request)
+    assert not computed_blocks.blocks[0]
+    assert num_computed_tokens == 0
+    assert manager.allocate_slots(request, request.num_tokens) is None
+    manager.free(request)
+
+    record_completed_access.assert_not_called()
+    assert manager.prefix_retention_tracker.completed_ordinal == 0
+
+
 def test_cache_blocks_multi_group():
     """
     This tests that blocks are cached correctly for different kv cache groups.
@@ -1833,9 +1907,21 @@ def test_reset_prefix_cache():
     )
     assert blocks is not None and blocks.get_block_ids() == ([5],)
 
+    resident_hashes = tuple(
+        make_block_hash_with_group_id(block_hash, 0) for block_hash in req0.block_hashes
+    )
+    assert manager.record_completed_request_access(req0)
+    before_failed_reset = manager.prefix_retention_tracker.snapshot(resident_hashes)
+    assert before_failed_reset.completed_ordinal == 1
+    assert before_failed_reset.metadata
+
     # Failed to reset prefix cache because some blocks are not freed yet.
     assert not manager.reset_prefix_cache()
     assert manager.block_pool.cached_block_hash_to_block
+    assert (
+        manager.prefix_retention_tracker.snapshot(resident_hashes)
+        == before_failed_reset
+    )
 
     # Free the blocks.
     manager.free(req0)
@@ -1844,6 +1930,9 @@ def test_reset_prefix_cache():
     assert manager.reset_prefix_cache()
     assert not manager.block_pool.cached_block_hash_to_block
     assert all([blk.block_hash is None for blk in manager.block_pool.blocks])
+    reset_snapshot = manager.prefix_retention_tracker.snapshot(resident_hashes)
+    assert reset_snapshot.completed_ordinal == 0
+    assert not reset_snapshot.metadata
 
 
 def test_prefix_cache_stats_disabled():
