@@ -483,7 +483,7 @@ class KVCacheManager:
             if block.block_hash != expected_hash:
                 return False
             chain.append(block.block_hash)
-        return self.prefix_retention_tracker.record_completed_access(chain)
+        return self.block_pool.record_completed_prefix_access(request.request_id, chain)
 
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int

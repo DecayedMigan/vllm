@@ -39,6 +39,26 @@ class PrefixRetentionSnapshot:
     _generation: int = 0
 
 
+@dataclass(frozen=True)
+class PrefixRetentionMetadataState:
+    """Read-only tracker metadata for an independent observer."""
+
+    block_hash: BlockHashWithGroupId
+    parent: BlockHashWithGroupId | None
+    completed_count: int
+    last_access_ordinal: int
+    gaps: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class PrefixRetentionObserverState:
+    """Immutable tracker state without invoking the policy snapshot API."""
+
+    generation: int
+    completed_ordinal: int
+    metadata: tuple[PrefixRetentionMetadataState, ...]
+
+
 @dataclass
 class _MutableMetadata:
     parent: BlockHashWithGroupId | None
@@ -140,6 +160,26 @@ class PrefixRetentionTracker:
             hash_block_size=self.hash_block_size,
             metadata=metadata,
             _generation=self._generation,
+        )
+
+    def observation_state(self) -> PrefixRetentionObserverState:
+        """Freeze policy metadata without changing policy or allocation state."""
+        metadata = tuple(
+            PrefixRetentionMetadataState(
+                block_hash=key,
+                parent=value.parent,
+                completed_count=value.completed_count,
+                last_access_ordinal=value.last_access_ordinal,
+                gaps=value.gaps,
+            )
+            for key, value in sorted(
+                self._metadata.items(), key=lambda item: _canonical_key(item[0])
+            )
+        )
+        return PrefixRetentionObserverState(
+            generation=self._generation,
+            completed_ordinal=self.completed_ordinal,
+            metadata=metadata,
         )
 
     def protected_hashes(

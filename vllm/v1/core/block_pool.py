@@ -28,6 +28,18 @@ from vllm.v1.core.kv_cache_utils import (
     maybe_convert_block_hash,
 )
 from vllm.v1.core.prefix_retention import PrefixRetentionTracker
+from vllm.v1.core.prefix_retention_observer import (
+    PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION,
+    PrefixRetentionBlockCategory,
+    PrefixRetentionBlockPreimage,
+    PrefixRetentionCompletedAccessReceipt,
+    PrefixRetentionDecisionReceipt,
+    PrefixRetentionHashPreimage,
+    PrefixRetentionReceiptBatch,
+    PrefixRetentionReceiptBuffer,
+    PrefixRetentionTrackerMetadataPreimage,
+    disabled_prefix_retention_receipt_batch,
+)
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -151,6 +163,8 @@ class BlockPool:
         enable_kv_cache_events: Whether to enable kv cache events.
         metrics_collector: Optional metrics collector for tracking block residency.
         prefix_retention_tracker: Optional stable-hash retention metadata tracker.
+        enable_prefix_retention_observer: Enable bounded read-only decision receipts.
+        prefix_retention_observer_capacity: Maximum undrained observer receipts.
     """
 
     def __init__(
@@ -161,6 +175,8 @@ class BlockPool:
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
         prefix_retention_tracker: PrefixRetentionTracker | None = None,
+        enable_prefix_retention_observer: bool = False,
+        prefix_retention_observer_capacity: int = 256,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -189,6 +205,144 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
         self.prefix_retention_tracker = prefix_retention_tracker
+        self._prefix_retention_receipt_buffer = (
+            PrefixRetentionReceiptBuffer(prefix_retention_observer_capacity)
+            if enable_prefix_retention_observer
+            else None
+        )
+        self._prefix_retention_allocation_ordinal = 0
+
+    @property
+    def prefix_retention_observation_failed(self) -> bool:
+        buffer = self._prefix_retention_receipt_buffer
+        return buffer.observation_failed if buffer is not None else False
+
+    def take_prefix_retention_receipts(
+        self,
+    ) -> PrefixRetentionReceiptBatch:
+        """Take and clear allocation receipts without resetting failure state."""
+        buffer = self._prefix_retention_receipt_buffer
+        return (
+            buffer.drain()
+            if buffer is not None
+            else disabled_prefix_retention_receipt_batch()
+        )
+
+    @staticmethod
+    def _prefix_retention_preimage(
+        block: KVCacheBlock,
+        queue_ordinal: int,
+        protected_hashes: AbstractSet[BlockHashWithGroupId],
+    ) -> PrefixRetentionBlockPreimage:
+        block_hash = block.block_hash
+        if block_hash is None:
+            category = PrefixRetentionBlockCategory.UNHASHED
+            block_hash_hex = None
+            group_id = None
+        elif block_hash in protected_hashes:
+            category = PrefixRetentionBlockCategory.PROTECTED_CACHED
+            block_hash_hex = bytes(block_hash).hex()
+            group_id = get_group_id(block_hash)
+        else:
+            category = PrefixRetentionBlockCategory.UNPROTECTED_CACHED
+            block_hash_hex = bytes(block_hash).hex()
+            group_id = get_group_id(block_hash)
+        return PrefixRetentionBlockPreimage(
+            queue_ordinal=queue_ordinal,
+            block_id=block.block_id,
+            block_hash_hex=block_hash_hex,
+            group_id=group_id,
+            category=category,
+        )
+
+    def _capture_prefix_retention_preimage(
+        self,
+        protected_hashes: AbstractSet[BlockHashWithGroupId],
+    ) -> tuple[
+        tuple[PrefixRetentionBlockPreimage, ...],
+        tuple[PrefixRetentionTrackerMetadataPreimage, ...],
+        str,
+        int,
+        int,
+        int,
+    ]:
+        candidates = tuple(
+            self._prefix_retention_preimage(block, queue_ordinal, protected_hashes)
+            for queue_ordinal, block in enumerate(
+                self.free_block_queue.get_all_free_blocks()
+            )
+        )
+        tracker = self.prefix_retention_tracker
+        if tracker is None:
+            return candidates, (), "lru", 0, 0, 0
+        state = tracker.observation_state()
+        metadata = tuple(
+            PrefixRetentionTrackerMetadataPreimage(
+                block_hash_hex=bytes(item.block_hash).hex(),
+                group_id=get_group_id(item.block_hash),
+                parent_hash_hex=(
+                    bytes(item.parent).hex() if item.parent is not None else None
+                ),
+                parent_group_id=(
+                    get_group_id(item.parent) if item.parent is not None else None
+                ),
+                completed_count=item.completed_count,
+                last_access_ordinal=item.last_access_ordinal,
+                last_four_gaps=item.gaps,
+            )
+            for item in state.metadata
+        )
+        return (
+            candidates,
+            metadata,
+            tracker.policy.value,
+            tracker.budget_blocks,
+            state.generation,
+            state.completed_ordinal,
+        )
+
+    @staticmethod
+    def _select_prefix_retention_preimages(
+        candidates: tuple[PrefixRetentionBlockPreimage, ...],
+        selected_blocks: Sequence[KVCacheBlock],
+    ) -> tuple[PrefixRetentionBlockPreimage, ...]:
+        candidate_by_id = {candidate.block_id: candidate for candidate in candidates}
+        return tuple(candidate_by_id[block.block_id] for block in selected_blocks)
+
+    def record_completed_prefix_access(
+        self,
+        request_id: str,
+        ordered_hash_chain: Sequence[BlockHashWithGroupId],
+    ) -> bool:
+        """Record a true completion and append its observation afterwards."""
+        tracker = self.prefix_retention_tracker
+        if tracker is None or not tracker.record_completed_access(ordered_hash_chain):
+            return False
+        buffer = self._prefix_retention_receipt_buffer
+        if buffer is not None:
+            try:
+                state = tracker.observation_state()
+                chain = tuple(
+                    PrefixRetentionHashPreimage(
+                        block_hash_hex=bytes(block_hash).hex(),
+                        group_id=get_group_id(block_hash),
+                    )
+                    for block_hash in ordered_hash_chain
+                )
+                buffer.append(
+                    PrefixRetentionCompletedAccessReceipt(
+                        schema_version=PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION,
+                        request_id=request_id,
+                        policy=tracker.policy.value,
+                        budget_blocks=tracker.budget_blocks,
+                        tracker_generation=state.generation,
+                        completed_ordinal=state.completed_ordinal,
+                        ordered_hash_chain=chain,
+                    )
+                )
+            except Exception:
+                buffer.mark_failed()
+        return True
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -359,6 +513,7 @@ class BlockPool:
         num_blocks: int,
         *,
         protected_hashes: AbstractSet[BlockHashWithGroupId] | None = None,
+        request_id: str | None = None,
     ) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
 
@@ -369,12 +524,60 @@ class BlockPool:
             protected_hashes: Group-aware cached block identities to prefer
                 retaining. Protection is advisory and never prevents an
                 otherwise feasible allocation.
+            request_id: Optional scheduler request identity for observation.
 
         Returns:
             A list of new block.
         """
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+
+        if num_blocks == 0:
+            return []
+
+        buffer = self._prefix_retention_receipt_buffer
+        if buffer is None:
+            if not protected_hashes:
+                ret = self.free_block_queue.popleft_n(num_blocks)
+            else:
+                ret = self.free_block_queue.popleft_n_prefer_unprotected(
+                    num_blocks, protected_hashes
+                )
+            if self.enable_caching:
+                for block in ret:
+                    self._maybe_evict_cached_block(block)
+                    assert block.ref_cnt == 0
+                    block.ref_cnt += 1
+                    if self.metrics_collector:
+                        self.metrics_collector.on_block_allocated(block)
+            else:
+                for block in ret:
+                    assert block.ref_cnt == 0
+                    block.ref_cnt += 1
+                    if self.metrics_collector:
+                        self.metrics_collector.on_block_allocated(block)
+            return ret
+
+        free_blocks_before = self.get_num_free_blocks()
+        frozen_protected_hashes: frozenset[BlockHashWithGroupId] = frozenset()
+        candidates: tuple[PrefixRetentionBlockPreimage, ...] | None = None
+        tracker_metadata: tuple[PrefixRetentionTrackerMetadataPreimage, ...] = ()
+        policy = "lru"
+        budget_blocks = 0
+        tracker_generation = 0
+        completed_ordinal = 0
+        try:
+            frozen_protected_hashes = frozenset(protected_hashes or ())
+            (
+                candidates,
+                tracker_metadata,
+                policy,
+                budget_blocks,
+                tracker_generation,
+                completed_ordinal,
+            ) = self._capture_prefix_retention_preimage(frozen_protected_hashes)
+        except Exception:
+            buffer.mark_failed()
 
         if not protected_hashes:
             ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
@@ -383,10 +586,19 @@ class BlockPool:
                 num_blocks, protected_hashes
             )
 
+        selected: tuple[PrefixRetentionBlockPreimage, ...] | None = None
+        if candidates is not None:
+            try:
+                selected = self._select_prefix_retention_preimages(candidates, ret)
+            except Exception:
+                buffer.mark_failed()
+        victims: list[PrefixRetentionBlockPreimage] = []
+
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
-            for block in ret:
-                self._maybe_evict_cached_block(block)
+            for index, block in enumerate(ret):
+                if self._maybe_evict_cached_block(block) and selected is not None:
+                    victims.append(selected[index])
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
@@ -397,6 +609,41 @@ class BlockPool:
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+
+        if buffer is not None:
+            self._prefix_retention_allocation_ordinal += 1
+            if candidates is not None and selected is not None:
+                try:
+                    protected_hashes_hex = tuple(
+                        sorted(
+                            bytes(block_hash).hex()
+                            for block_hash in frozen_protected_hashes
+                        )
+                    )
+                    frozen_victims = tuple(victims)
+                    receipt = PrefixRetentionDecisionReceipt(
+                        schema_version=PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION,
+                        request_id=request_id,
+                        allocation_ordinal=self._prefix_retention_allocation_ordinal,
+                        policy=policy,
+                        budget_blocks=budget_blocks,
+                        tracker_generation=tracker_generation,
+                        completed_ordinal=completed_ordinal,
+                        tracker_metadata_preimage=tracker_metadata,
+                        protected_hashes_hex=protected_hashes_hex,
+                        candidates=candidates,
+                        selected=selected,
+                        victims=frozen_victims,
+                        free_blocks_before=free_blocks_before,
+                        free_blocks_after=self.get_num_free_blocks(),
+                        non_null_used_blocks_after=sum(
+                            block.ref_cnt > 0 and not block.is_null
+                            for block in self.blocks
+                        ),
+                    )
+                    buffer.append(receipt)
+                except Exception:
+                    buffer.mark_failed()
         return ret
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
