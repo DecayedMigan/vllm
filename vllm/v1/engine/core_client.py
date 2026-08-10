@@ -32,6 +32,10 @@ from vllm.utils.network_utils import (
     get_open_zmq_inproc_path,
     make_zmq_socket,
 )
+from vllm.v1.core.prefix_retention_observer import (
+    PrefixRetentionReceiptBatch,
+    PrefixRetentionResetReceipt,
+)
 from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
     EEPNotificationType,
@@ -151,6 +155,14 @@ class EngineCoreClient(ABC):
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
+        raise NotImplementedError
+
+    def take_prefix_retention_receipts(self) -> PrefixRetentionReceiptBatch:
+        raise ValueError("prefix_retention_receipts_inproc_only")
+
+    def reset_prefix_cache_with_receipt(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> PrefixRetentionResetReceipt:
         raise NotImplementedError
 
     def reset_encoder_cache(self) -> None:
@@ -314,6 +326,16 @@ class InprocClient(EngineCoreClient):
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
         return self.engine_core.reset_prefix_cache(
+            reset_running_requests, reset_connector
+        )
+
+    def take_prefix_retention_receipts(self) -> PrefixRetentionReceiptBatch:
+        return self.engine_core.take_prefix_retention_receipts()
+
+    def reset_prefix_cache_with_receipt(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> PrefixRetentionResetReceipt:
+        return self.engine_core.reset_prefix_cache_with_receipt(
             reset_running_requests, reset_connector
         )
 
@@ -858,6 +880,8 @@ class SyncMPClient(MPClient):
         self.add_pending_message(tracker, request)
 
     def call_utility(self, method: str, *args) -> Any:
+        if method == "take_prefix_retention_receipts":
+            raise ValueError("prefix_retention_receipts_inproc_only")
         call_id = uuid.uuid1().int >> 64
         future: Future[Any] = Future()
         self.utility_results[call_id] = future
@@ -888,6 +912,15 @@ class SyncMPClient(MPClient):
     ) -> bool:
         return self.call_utility(
             "reset_prefix_cache", reset_running_requests, reset_connector
+        )
+
+    def reset_prefix_cache_with_receipt(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> PrefixRetentionResetReceipt:
+        return self.call_utility(
+            "reset_prefix_cache_with_receipt",
+            reset_running_requests,
+            reset_connector,
         )
 
     def reset_encoder_cache(self) -> None:
@@ -1084,6 +1117,8 @@ class AsyncMPClient(MPClient):
         return future
 
     async def call_utility_async(self, method: str, *args) -> Any:
+        if method == "take_prefix_retention_receipts":
+            raise ValueError("prefix_retention_receipts_inproc_only")
         return await self._call_utility_async(method, *args, engine=self.core_engine)
 
     async def _call_utility_async(

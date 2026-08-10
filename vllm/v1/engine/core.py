@@ -50,6 +50,10 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
     resolve_kv_cache_block_sizes,
 )
+from vllm.v1.core.prefix_retention_observer import (
+    PrefixRetentionReceiptBatch,
+    PrefixRetentionResetReceipt,
+)
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
@@ -650,6 +654,16 @@ class EngineCore:
             reset_running_requests, reset_connector
         )
 
+    def take_prefix_retention_receipts(self) -> PrefixRetentionReceiptBatch:
+        return self.scheduler.take_prefix_retention_receipts()
+
+    def reset_prefix_cache_with_receipt(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> PrefixRetentionResetReceipt:
+        return self.scheduler.reset_prefix_cache_with_receipt(
+            reset_running_requests, reset_connector
+        )
+
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
 
@@ -861,6 +875,9 @@ class EngineCoreProc(EngineCore):
     """ZMQ-wrapper for running EngineCore in background process."""
 
     ENGINE_CORE_DEAD = b"ENGINE_CORE_DEAD"
+
+    def take_prefix_retention_receipts(self) -> PrefixRetentionReceiptBatch:
+        raise ValueError("prefix_retention_receipts_inproc_only")
     addresses: EngineZmqAddresses
 
     @instrument(span_name="EngineCoreProc init")

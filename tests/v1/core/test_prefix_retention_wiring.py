@@ -38,14 +38,21 @@ def test_prefix_retention_cli_args():
                 "recurplan",
                 "--prefix-retention-budget-blocks",
                 "7",
+                "--enable-prefix-retention-observer",
+                "--prefix-retention-observer-capacity",
+                "19",
             ]
         )
     )
 
     assert defaults.prefix_retention_policy == "lru"
     assert defaults.prefix_retention_budget_blocks == 0
+    assert defaults.enable_prefix_retention_observer is False
+    assert defaults.prefix_retention_observer_capacity == 256
     assert configured.prefix_retention_policy == "recurplan"
     assert configured.prefix_retention_budget_blocks == 7
+    assert configured.enable_prefix_retention_observer is True
+    assert configured.prefix_retention_observer_capacity == 19
 
 
 def _make_gate_inputs(
@@ -105,6 +112,8 @@ def _make_real_scheduler_inputs(
     policy: str = "recurplan",
     budget: int = 2,
     enable_prefix_caching: bool = True,
+    enable_observer: bool = False,
+    observer_capacity: int = 256,
 ):
     num_blocks = 8
     cache_config = CacheConfig(
@@ -112,6 +121,8 @@ def _make_real_scheduler_inputs(
         enable_prefix_caching=enable_prefix_caching,
         prefix_retention_policy=policy,
         prefix_retention_budget_blocks=budget,
+        enable_prefix_retention_observer=enable_observer,
+        prefix_retention_observer_capacity=observer_capacity,
     )
     cache_config.num_gpu_blocks = num_blocks
     model_config = SimpleNamespace(
@@ -200,7 +211,10 @@ def test_capability_gate_builds_requested_tracker(policy: str, budget: int):
 
 
 def test_real_scheduler_wires_one_tracker_to_manager_and_pool(monkeypatch):
-    vllm_config, kv_cache_config = _make_real_scheduler_inputs()
+    vllm_config, kv_cache_config = _make_real_scheduler_inputs(
+        enable_observer=True,
+        observer_capacity=19,
+    )
     event_publisher = Mock()
     monkeypatch.setattr(
         scheduler_module.EventPublisherFactory,
@@ -223,6 +237,95 @@ def test_real_scheduler_wires_one_tracker_to_manager_and_pool(monkeypatch):
     assert tracker.policy is PrefixRetentionPolicy.RECURPLAN
     assert tracker is scheduler.kv_cache_manager.prefix_retention_tracker
     assert tracker is scheduler.kv_cache_manager.block_pool.prefix_retention_tracker
+    batch = scheduler.take_prefix_retention_receipts()
+    assert batch.observer_enabled is True
+    assert batch.capacity == 19
+
+    generation_before = tracker.observation_state().generation
+    reset = scheduler.reset_prefix_cache_with_receipt(reset_connector=True)
+    assert reset.local_cache_reset is True
+    assert reset.tracker_history_reset is True
+    assert reset.connector_reset_requested is True
+    assert reset.connector_reset_successful is True
+    assert reset.tracker_generation_before == generation_before
+    assert reset.tracker_generation_after == generation_before + 1
+    assert reset.reset_successful is True
+    buffer = scheduler.kv_cache_manager.block_pool._prefix_retention_receipt_buffer
+    assert buffer is not None
+    buffer.mark_failed()
+    reset_batch = scheduler.take_prefix_retention_receipts()
+    assert reset_batch.receipts == (reset,)
+    assert reset_batch.observation_failed is True
+
+
+def test_reset_receipt_reports_local_failure_without_resetting_tracker(monkeypatch):
+    vllm_config, kv_cache_config = _make_real_scheduler_inputs(enable_observer=True)
+    monkeypatch.setattr(
+        scheduler_module.EventPublisherFactory,
+        "create",
+        Mock(return_value=Mock()),
+    )
+    mm_registry = Mock()
+    mm_registry.supports_multimodal_inputs.return_value = False
+    scheduler = Scheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        structured_output_manager=Mock(),
+        block_size=4,
+        hash_block_size=4,
+        mm_registry=mm_registry,
+    )
+    scheduler.kv_cache_manager.block_pool.get_new_blocks(1)
+    generation_before = (
+        scheduler.prefix_retention_tracker.observation_state().generation
+    )
+
+    reset = scheduler.reset_prefix_cache_with_receipt()
+
+    assert reset.local_cache_reset is False
+    assert reset.tracker_history_reset is False
+    assert reset.connector_reset_requested is False
+    assert reset.connector_reset_successful is None
+    assert reset.tracker_generation_before == generation_before
+    assert reset.tracker_generation_after == generation_before
+    assert reset.reset_successful is False
+
+
+def test_reset_receipt_reports_connector_failure(monkeypatch):
+    vllm_config, kv_cache_config = _make_real_scheduler_inputs(enable_observer=True)
+    monkeypatch.setattr(
+        scheduler_module.EventPublisherFactory,
+        "create",
+        Mock(return_value=Mock()),
+    )
+    mm_registry = Mock()
+    mm_registry.supports_multimodal_inputs.return_value = False
+    scheduler = Scheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        structured_output_manager=Mock(),
+        block_size=4,
+        hash_block_size=4,
+        mm_registry=mm_registry,
+    )
+    scheduler.connector = Mock()
+    scheduler.connector.reset_cache.return_value = False
+
+    reset = scheduler.reset_prefix_cache_with_receipt(reset_connector=True)
+
+    assert reset.local_cache_reset is True
+    assert reset.tracker_history_reset is True
+    assert reset.connector_reset_successful is False
+    assert reset.reset_successful is False
+
+
+@pytest.mark.parametrize("capacity", [0, -1, True, 1.5])
+def test_cache_config_rejects_invalid_observer_capacity(capacity):
+    with pytest.raises(ValueError, match="invalid_observer_capacity"):
+        CacheConfig(
+            enable_prefix_retention_observer=True,
+            prefix_retention_observer_capacity=capacity,
+        )
 
 
 def test_real_scheduler_invalid_gate_precedes_all_side_effect_factories(monkeypatch):

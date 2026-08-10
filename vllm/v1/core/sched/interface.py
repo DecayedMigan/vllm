@@ -10,6 +10,10 @@ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
+    from vllm.v1.core.prefix_retention_observer import (
+        PrefixRetentionReceiptBatch,
+        PrefixRetentionResetReceipt,
+    )
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.engine import EngineCoreOutputs
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -211,6 +215,16 @@ class SchedulerInterface(ABC):
                 will only reset the KV prefix cache when there is no running request
                 taking KV cache.
         """
+        raise NotImplementedError
+
+    @abstractmethod
+    def take_prefix_retention_receipts(self) -> "PrefixRetentionReceiptBatch":
+        raise NotImplementedError
+
+    @abstractmethod
+    def reset_prefix_cache_with_receipt(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> "PrefixRetentionResetReceipt":
         raise NotImplementedError
 
     @abstractmethod

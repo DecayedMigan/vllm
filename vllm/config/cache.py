@@ -112,6 +112,10 @@ class CacheConfig:
     """Advisory policy used to retain reusable cached prefixes under pressure."""
     prefix_retention_budget_blocks: int = 0
     """Maximum number of resident blocks advisory retention may protect."""
+    enable_prefix_retention_observer: bool = False
+    """Expose bounded retention receipts to an in-process engine only."""
+    prefix_retention_observer_capacity: int = 256
+    """Maximum number of undrained retention receipts."""
     calculate_kv_scales: bool = False
     """Deprecated: This option is deprecated and will be removed in v0.19.
     It enables dynamic calculation of `k_scale` and `v_scale` when
@@ -202,6 +206,8 @@ class CacheConfig:
             "prefix_caching_hash_algo",
             "prefix_retention_policy",
             "prefix_retention_budget_blocks",
+            "enable_prefix_retention_observer",
+            "prefix_retention_observer_capacity",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "hash_block_size",
             "mamba_page_size_padded",
@@ -269,6 +275,20 @@ class CacheConfig:
     def _validate_prefix_retention_budget_type(cls, value: Any) -> int:
         if type(value) is not int or value < 0:
             raise ValueError("invalid_budget")
+        return value
+
+    @field_validator("enable_prefix_retention_observer", mode="before")
+    @classmethod
+    def _validate_prefix_retention_observer_type(cls, value: Any) -> bool:
+        if type(value) is not bool:
+            raise ValueError("invalid_observer_enabled")
+        return value
+
+    @field_validator("prefix_retention_observer_capacity", mode="before")
+    @classmethod
+    def _validate_prefix_retention_observer_capacity(cls, value: Any) -> int:
+        if type(value) is not int or value <= 0:
+            raise ValueError("invalid_observer_capacity")
         return value
 
     @field_validator("calculate_kv_scales", mode="after")

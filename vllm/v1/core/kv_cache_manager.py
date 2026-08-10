@@ -130,6 +130,8 @@ class KVCacheManager:
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         prefix_retention_tracker: PrefixRetentionTracker | None = None,
+        enable_prefix_retention_observer: bool = False,
+        prefix_retention_observer_capacity: int = 256,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -159,6 +161,8 @@ class KVCacheManager:
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
+            enable_prefix_retention_observer=enable_prefix_retention_observer,
+            prefix_retention_observer_capacity=prefix_retention_observer_capacity,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool

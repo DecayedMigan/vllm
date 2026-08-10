@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU contracts for prefix-retention allocation decision receipts."""
 
+import asyncio
 from dataclasses import FrozenInstanceError
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 import vllm.v1.core.prefix_retention_observer as prefix_retention_observer
 from vllm.distributed.kv_events import BlockRemoved
@@ -25,7 +27,19 @@ from vllm.v1.core.prefix_retention_observer import (
     PrefixRetentionCompletedAccessReceipt,
     PrefixRetentionHashPreimage,
     PrefixRetentionReceiptBatch,
+    PrefixRetentionResetReceipt,
 )
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+from vllm.v1.engine.core import EngineCoreProc
+from vllm.v1.engine.core_client import (
+    AsyncMPClient,
+    EngineCoreClient,
+    InprocClient,
+    MPClient,
+    SyncMPClient,
+)
+from vllm.v1.engine.llm_engine import LLMEngine
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 pytestmark = pytest.mark.cpu_test
 
@@ -44,6 +58,101 @@ def _receipts(pool: BlockPool):
     batch = pool.take_prefix_retention_receipts()
     assert isinstance(batch, PrefixRetentionReceiptBatch)
     return batch.receipts
+
+
+def test_inproc_drain_forwards_without_serialization():
+    expected = prefix_retention_observer.disabled_prefix_retention_receipt_batch()
+    client = object.__new__(InprocClient)
+    client.engine_core = Mock()
+    client.engine_core.take_prefix_retention_receipts.return_value = expected
+
+    assert client.take_prefix_retention_receipts() is expected
+    client.engine_core.take_prefix_retention_receipts.assert_called_once_with()
+
+    engine = object.__new__(LLMEngine)
+    engine.engine_core = client
+    assert engine.take_prefix_retention_receipts() is expected
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        EngineCoreClient.take_prefix_retention_receipts,
+        MPClient.take_prefix_retention_receipts,
+        EngineCoreProc.take_prefix_retention_receipts,
+    ],
+)
+def test_non_inproc_receipt_drain_is_rejected(method):
+    with pytest.raises(ValueError, match="prefix_retention_receipts_inproc_only"):
+        method(Mock())
+
+
+def test_multiprocess_utility_bypasses_are_rejected_before_transport():
+    with pytest.raises(ValueError, match="prefix_retention_receipts_inproc_only"):
+        SyncMPClient.call_utility(Mock(), "take_prefix_retention_receipts")
+
+    async def invoke_async_bypass() -> None:
+        with pytest.raises(
+            ValueError, match="prefix_retention_receipts_inproc_only"
+        ):
+            await AsyncMPClient.call_utility_async(
+                Mock(), "take_prefix_retention_receipts"
+            )
+
+    asyncio.run(invoke_async_bypass())
+
+
+def test_reset_receipt_is_immutable_and_part_of_the_observer_union():
+    receipt = PrefixRetentionResetReceipt(
+        schema_version=PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION,
+        reset_running_requests=False,
+        connector_reset_requested=True,
+        local_cache_reset=True,
+        tracker_history_reset=True,
+        connector_reset_successful=True,
+        tracker_generation_before=2,
+        tracker_generation_after=3,
+        reset_successful=True,
+    )
+
+    assert receipt.reset_successful is True
+    with pytest.raises(FrozenInstanceError):
+        receipt.reset_successful = False  # type: ignore[misc]
+
+
+def _full_attention_manager(pool: BlockPool) -> FullAttentionManager:
+    spec = FullAttentionSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    return FullAttentionManager(
+        spec,
+        block_pool=pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=4,
+    )
+
+
+def test_real_single_type_allocations_preserve_request_identity():
+    pool = BlockPool(
+        num_gpu_blocks=6,
+        enable_caching=True,
+        hash_block_size=4,
+        enable_prefix_retention_observer=True,
+    )
+    manager = _full_attention_manager(pool)
+
+    manager.allocate_new_blocks("direct-request", 4, 4)
+    manager.allocate_new_computed_blocks("external-request", (), 0, 4)
+
+    receipts = _receipts(pool)
+    assert [receipt.request_id for receipt in receipts] == [
+        "direct-request",
+        "external-request",
+    ]
 
 
 def test_lru_records_real_victims_with_group_aware_hashes_and_is_immutable():

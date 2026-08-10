@@ -40,6 +40,11 @@ from vllm.v1.core.prefix_retention import (
     PrefixRetentionPolicy,
     PrefixRetentionTracker,
 )
+from vllm.v1.core.prefix_retention_observer import (
+    PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION,
+    PrefixRetentionReceiptBatch,
+    PrefixRetentionResetReceipt,
+)
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -350,6 +355,12 @@ class Scheduler(SchedulerInterface):
             hash_block_size=effective_hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             prefix_retention_tracker=self.prefix_retention_tracker,
+            enable_prefix_retention_observer=(
+                self.cache_config.enable_prefix_retention_observer
+            ),
+            prefix_retention_observer_capacity=(
+                self.cache_config.prefix_retention_observer_capacity
+            ),
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -2036,6 +2047,17 @@ class Scheduler(SchedulerInterface):
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
+        return self.reset_prefix_cache_with_receipt(
+            reset_running_requests, reset_connector
+        ).reset_successful
+
+    def take_prefix_retention_receipts(self) -> PrefixRetentionReceiptBatch:
+        """Drain read-only observer receipts from the authoritative block pool."""
+        return self.kv_cache_manager.block_pool.take_prefix_retention_receipts()
+
+    def reset_prefix_cache_with_receipt(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> PrefixRetentionResetReceipt:
         """Reset the KV prefix cache.
 
         If reset_running_requests is True, all the running requests will be
@@ -2069,8 +2091,13 @@ class Scheduler(SchedulerInterface):
             # persistent batch in the model runner.
             self.prev_step_scheduled_req_ids.clear()
 
-        reset_successful = self.kv_cache_manager.reset_prefix_cache()
-        if reset_running_requests and not reset_successful:
+        generation_before = self.prefix_retention_tracker.observation_state().generation
+        local_cache_reset = self.kv_cache_manager.reset_prefix_cache()
+        generation_after = self.prefix_retention_tracker.observation_state().generation
+        tracker_history_reset = (
+            local_cache_reset and generation_after == generation_before + 1
+        )
+        if reset_running_requests and not local_cache_reset:
             raise RuntimeError(
                 "Failed to reset KV cache even when all the running requests are "
                 "preempted and moved to the waiting queue. This is likely due to "
@@ -2078,10 +2105,25 @@ class Scheduler(SchedulerInterface):
                 "which is not supported yet."
             )
 
-        if reset_connector:
-            reset_successful = self.reset_connector_cache() and reset_successful
-
-        return reset_successful
+        connector_reset_successful = (
+            self.reset_connector_cache() if reset_connector else None
+        )
+        reset_successful = local_cache_reset and (
+            connector_reset_successful is not False
+        )
+        receipt = PrefixRetentionResetReceipt(
+            schema_version=PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION,
+            reset_running_requests=reset_running_requests,
+            connector_reset_requested=reset_connector,
+            local_cache_reset=local_cache_reset,
+            tracker_history_reset=tracker_history_reset,
+            connector_reset_successful=connector_reset_successful,
+            tracker_generation_before=generation_before,
+            tracker_generation_after=generation_after,
+            reset_successful=reset_successful,
+        )
+        self.kv_cache_manager.block_pool.record_prefix_retention_reset(receipt)
+        return receipt
 
     def reset_connector_cache(self) -> bool:
         if self.connector is None:

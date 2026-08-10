@@ -511,6 +511,12 @@ class EngineArgs:
         CacheConfig.prefix_retention_policy
     )
     prefix_retention_budget_blocks: int = CacheConfig.prefix_retention_budget_blocks
+    enable_prefix_retention_observer: bool = (
+        CacheConfig.enable_prefix_retention_observer
+    )
+    prefix_retention_observer_capacity: int = (
+        CacheConfig.prefix_retention_observer_capacity
+    )
     disable_sliding_window: bool = ModelConfig.disable_sliding_window
     disable_cascade_attn: bool = ModelConfig.disable_cascade_attn
     offload_backend: str = OffloadConfig.offload_backend
@@ -1153,6 +1159,14 @@ class EngineArgs:
             **cache_kwargs["prefix_retention_budget_blocks"],
         )
         cache_group.add_argument(
+            "--enable-prefix-retention-observer",
+            **cache_kwargs["enable_prefix_retention_observer"],
+        )
+        cache_group.add_argument(
+            "--prefix-retention-observer-capacity",
+            **cache_kwargs["prefix_retention_observer_capacity"],
+        )
+        cache_group.add_argument(
             "--calculate-kv-scales", **cache_kwargs["calculate_kv_scales"]
         )
         cache_group.add_argument(
@@ -1780,6 +1794,10 @@ class EngineArgs:
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             prefix_retention_policy=self.prefix_retention_policy,
             prefix_retention_budget_blocks=self.prefix_retention_budget_blocks,
+            enable_prefix_retention_observer=self.enable_prefix_retention_observer,
+            prefix_retention_observer_capacity=(
+                self.prefix_retention_observer_capacity
+            ),
             calculate_kv_scales=self.calculate_kv_scales,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,

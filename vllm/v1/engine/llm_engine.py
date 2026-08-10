@@ -27,6 +27,10 @@ from vllm.tasks import SupportedTask
 from vllm.tokenizers import TokenizerLike
 from vllm.tracing import init_tracer
 from vllm.usage.usage_lib import UsageContext
+from vllm.v1.core.prefix_retention_observer import (
+    PrefixRetentionReceiptBatch,
+    PrefixRetentionResetReceipt,
+)
 from vllm.v1.engine import EngineCoreRequest, PauseMode
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.input_processor import InputProcessor
@@ -338,6 +342,16 @@ class LLMEngine:
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
         return self.engine_core.reset_prefix_cache(
+            reset_running_requests, reset_connector
+        )
+
+    def take_prefix_retention_receipts(self) -> PrefixRetentionReceiptBatch:
+        return self.engine_core.take_prefix_retention_receipts()
+
+    def reset_prefix_cache_with_receipt(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> PrefixRetentionResetReceipt:
+        return self.engine_core.reset_prefix_cache_with_receipt(
             reset_running_requests, reset_connector
         )
 

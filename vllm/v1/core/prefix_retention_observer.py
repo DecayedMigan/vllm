@@ -112,8 +112,25 @@ class PrefixRetentionCompletedAccessReceipt:
     ordered_hash_chain: tuple[PrefixRetentionHashPreimage, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class PrefixRetentionResetReceipt:
+    """Outcome of one cache reset without changing the legacy bool contract."""
+
+    schema_version: str
+    reset_running_requests: bool
+    connector_reset_requested: bool
+    local_cache_reset: bool
+    tracker_history_reset: bool
+    connector_reset_successful: bool | None
+    tracker_generation_before: int
+    tracker_generation_after: int
+    reset_successful: bool
+
+
 PrefixRetentionReceipt = (
-    PrefixRetentionDecisionReceipt | PrefixRetentionCompletedAccessReceipt
+    PrefixRetentionDecisionReceipt
+    | PrefixRetentionCompletedAccessReceipt
+    | PrefixRetentionResetReceipt
 )
 
 

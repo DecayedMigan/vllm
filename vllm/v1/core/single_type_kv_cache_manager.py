@@ -247,7 +247,8 @@ class SingleTypeKVCacheManager(ABC):
         if num_external_computed_tokens > 0:
             # Allocate new blocks for external computed tokens.
             allocated_blocks = self.block_pool.get_new_blocks(
-                cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
+                cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks),
+                request_id=request_id,
             )
             req_blocks.extend(allocated_blocks)
             if type(self.kv_cache_spec) in (
@@ -286,7 +287,9 @@ class SingleTypeKVCacheManager(ABC):
             return []
         else:
             new_blocks = self.block_pool.get_new_blocks(
-                num_new_blocks, protected_hashes=protected_hashes
+                num_new_blocks,
+                protected_hashes=protected_hashes,
+                request_id=request_id,
             )
             req_blocks.extend(new_blocks)
             if type(self.kv_cache_spec) in (
@@ -1208,7 +1211,9 @@ class MambaManager(SingleTypeKVCacheManager):
                 else:
                     assert num_new_blocks <= self.num_speculative_blocks + 1
                 new_blocks = self.block_pool.get_new_blocks(
-                    num_new_blocks, protected_hashes=protected_hashes
+                    num_new_blocks,
+                    protected_hashes=protected_hashes,
+                    request_id=request_id,
                 )
                 req_blocks.extend(new_blocks)
                 self._allocated_block_reqs.add(request_id)
