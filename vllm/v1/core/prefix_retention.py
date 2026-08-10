@@ -218,7 +218,7 @@ class PrefixRetentionTracker:
                     self._arc_b2.popitem(last=False)
                 self._arc_replace(key)
             self._arc_t1[key] = None
-        self._trim_arc_ghosts()
+        self._trim_arc_state()
 
     def _arc_replace(self, incoming: BlockHashWithGroupId) -> None:
         choose_t1 = bool(self._arc_t1) and (
@@ -231,6 +231,22 @@ class PrefixRetentionTracker:
         elif self._arc_t2:
             victim, _ = self._arc_t2.popitem(last=False)
             self._arc_b2[victim] = None
+
+    def _trim_arc_state(self) -> None:
+        capacity = self.budget_blocks
+        while len(self._arc_t1) + len(self._arc_t2) > capacity:
+            choose_t1 = bool(self._arc_t1) and (
+                len(self._arc_t1) > self._arc_target_t1 or not self._arc_t2
+            )
+            if choose_t1:
+                victim, _ = self._arc_t1.popitem(last=False)
+                self._arc_b1[victim] = None
+            elif self._arc_t2:
+                victim, _ = self._arc_t2.popitem(last=False)
+                self._arc_b2[victim] = None
+            else:
+                break
+        self._trim_arc_ghosts()
 
     def _trim_arc_ghosts(self) -> None:
         capacity = self.budget_blocks

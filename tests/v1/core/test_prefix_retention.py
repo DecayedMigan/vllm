@@ -178,6 +178,29 @@ def test_arc_ghost_hits_move_the_adaptive_partition_both_directions():
     assert len(ghosts) <= 2
 
 
+def test_arc_resident_history_never_exceeds_budget_under_repeated_churn():
+    tracker = _tracker(PrefixRetentionPolicy.ARC, budget=31)
+    keys = tuple(_hash(("key-%d" % index).encode()) for index in range(64))
+    for key in keys:
+        assert tracker.register_chain([key])
+
+    sequence = (
+        keys[:31]
+        + keys[31:62]
+        + keys[:31]
+        + keys[62:]
+        + keys[31:62]
+        + keys[:31]
+    )
+    for key in sequence:
+        assert tracker.record_completed_access([key])
+        state = tracker.arc_state()
+        resident = len(state.t1_lru_to_mru) + len(state.t2_lru_to_mru)
+        ghosts = len(state.b1_lru_to_mru) + len(state.b2_lru_to_mru)
+        assert resident <= 31
+        assert ghosts <= 31
+
+
 def test_arc_reset_and_victim_order_are_deterministic():
     a, b, c = (_hash(raw) for raw in (b"a", b"b", b"c"))
     tracker = _tracker(PrefixRetentionPolicy.ARC, budget=2)
