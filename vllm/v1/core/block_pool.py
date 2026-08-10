@@ -30,6 +30,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.core.prefix_retention import PrefixRetentionTracker
 from vllm.v1.core.prefix_retention_observer import (
     PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION,
+    PrefixRetentionARCPreimage,
     PrefixRetentionBlockCategory,
     PrefixRetentionBlockPreimage,
     PrefixRetentionCompletedAccessReceipt,
@@ -270,6 +271,7 @@ class BlockPool:
     ) -> tuple[
         tuple[PrefixRetentionBlockPreimage, ...],
         tuple[PrefixRetentionTrackerMetadataPreimage, ...],
+        PrefixRetentionARCPreimage,
         str,
         int,
         int,
@@ -282,8 +284,9 @@ class BlockPool:
             )
         )
         tracker = self.prefix_retention_tracker
+        empty_arc = PrefixRetentionARCPreimage(0, (), (), (), ())
         if tracker is None:
-            return candidates, (), "lru", 0, 0, 0
+            return candidates, (), empty_arc, "lru", 0, 0, 0
         state = tracker.observation_state()
         metadata = tuple(
             PrefixRetentionTrackerMetadataPreimage(
@@ -301,9 +304,18 @@ class BlockPool:
             )
             for item in state.metadata
         )
+        arc = state.arc_state
+        arc_preimage = PrefixRetentionARCPreimage(
+            target_t1=arc.target_t1,
+            t1_hashes_hex=tuple(bytes(key).hex() for key in arc.t1_lru_to_mru),
+            t2_hashes_hex=tuple(bytes(key).hex() for key in arc.t2_lru_to_mru),
+            b1_hashes_hex=tuple(bytes(key).hex() for key in arc.b1_lru_to_mru),
+            b2_hashes_hex=tuple(bytes(key).hex() for key in arc.b2_lru_to_mru),
+        )
         return (
             candidates,
             metadata,
+            arc_preimage,
             tracker.policy.value,
             tracker.budget_blocks,
             state.generation,
@@ -571,6 +583,7 @@ class BlockPool:
         frozen_protected_hashes: frozenset[BlockHashWithGroupId] = frozenset()
         candidates: tuple[PrefixRetentionBlockPreimage, ...] | None = None
         tracker_metadata: tuple[PrefixRetentionTrackerMetadataPreimage, ...] = ()
+        arc_preimage = PrefixRetentionARCPreimage(0, (), (), (), ())
         policy = "lru"
         budget_blocks = 0
         tracker_generation = 0
@@ -580,6 +593,7 @@ class BlockPool:
             (
                 candidates,
                 tracker_metadata,
+                arc_preimage,
                 policy,
                 budget_blocks,
                 tracker_generation,
@@ -639,6 +653,7 @@ class BlockPool:
                         tracker_generation=tracker_generation,
                         completed_ordinal=completed_ordinal,
                         tracker_metadata_preimage=tracker_metadata,
+                        arc_preimage=arc_preimage,
                         protected_hashes_hex=protected_hashes_hex,
                         candidates=candidates,
                         selected=selected,

@@ -50,6 +50,17 @@ class PrefixRetentionTrackerMetadataPreimage:
     last_four_gaps: tuple[int, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class PrefixRetentionARCPreimage:
+    """Complete bounded ARC state before one allocation decision."""
+
+    target_t1: int
+    t1_hashes_hex: tuple[str, ...]
+    t2_hashes_hex: tuple[str, ...]
+    b1_hashes_hex: tuple[str, ...]
+    b2_hashes_hex: tuple[str, ...]
+
+
 def _digest(value: object) -> str:
     payload = json.dumps(
         value,
@@ -90,6 +101,7 @@ class PrefixRetentionDecisionReceipt:
     tracker_generation: int
     completed_ordinal: int
     tracker_metadata_preimage: tuple[PrefixRetentionTrackerMetadataPreimage, ...]
+    arc_preimage: PrefixRetentionARCPreimage
     protected_hashes_hex: tuple[str, ...]
     candidates: tuple[PrefixRetentionBlockPreimage, ...]
     selected: tuple[PrefixRetentionBlockPreimage, ...]

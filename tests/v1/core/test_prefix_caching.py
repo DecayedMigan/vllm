@@ -2369,7 +2369,7 @@ def test_protected_eviction_preserves_maps_metrics_and_removal_events():
     ]
 
 
-def test_tracker_closure_is_preferred_and_no_recurrence_uses_fast_path(
+def test_tracker_closure_is_preferred_and_insufficient_history_falls_back_to_arc(
     monkeypatch,
 ):
     root = make_block_hash_with_group_id(BlockHash(b"root"), 6)
@@ -2416,8 +2416,10 @@ def test_tracker_closure_is_preferred_and_no_recurrence_uses_fast_path(
     assert no_recurrence.register_chain([root])
     for _ in range(3):
         assert no_recurrence.record_completed_access([root])
-    empty_protection = no_recurrence.protected_hashes(no_recurrence.snapshot([root]))
-    assert empty_protection == frozenset()
+    fallback_protection = no_recurrence.protected_hashes(
+        no_recurrence.snapshot([root])
+    )
+    assert fallback_protection == {root}
 
     no_recurrence_pool = BlockPool(
         num_gpu_blocks=3,
@@ -2439,11 +2441,11 @@ def test_tracker_closure_is_preferred_and_no_recurrence_uses_fast_path(
         block.block_id
         for block in no_recurrence_pool.get_new_blocks(
             1,
-            protected_hashes=empty_protection,
+            protected_hashes=fallback_protection,
         )
-    ] == [1]
-    popleft_n.assert_called_once_with(1)
-    prefer_unprotected.assert_not_called()
+    ] == [2]
+    popleft_n.assert_not_called()
+    prefer_unprotected.assert_called_once_with(1, fallback_protection)
 
 
 def _seed_retention_witness(
@@ -2694,7 +2696,7 @@ def test_manager_non_lru_fails_before_external_or_rejected_allocation(monkeypatc
     get_new_blocks.assert_not_called()
 
 
-def test_manager_recurplan_without_recurrence_uses_lru_fast_path(monkeypatch):
+def test_manager_recurplan_without_recurrence_uses_arc_fallback(monkeypatch):
     block_size = 4
     resident = make_block_hash_with_group_id(BlockHash(b"resident"), 0)
     other = make_block_hash_with_group_id(BlockHash(b"other"), 0)
@@ -2726,10 +2728,12 @@ def test_manager_recurplan_without_recurrence_uses_lru_fast_path(monkeypatch):
     )
 
     request = make_request("no-recurrence", list(range(4)), block_size, sha256)
-    assert manager.allocate_slots(request, request.num_tokens) is not None
+    blocks = manager.allocate_slots(request, request.num_tokens)
 
-    popleft_n.assert_called_once_with(1)
-    prefer.assert_not_called()
+    assert blocks is not None
+    assert blocks.get_block_ids() == ([2],)
+    popleft_n.assert_not_called()
+    prefer.assert_called_once_with(1, frozenset({resident}))
 
 
 def test_manager_successful_reset_invalidates_stale_retention(monkeypatch):

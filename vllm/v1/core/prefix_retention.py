@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pure policy state for advisory prefix-cache retention."""
 
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -18,6 +19,7 @@ class PrefixRetentionPolicy(str, Enum):
     LRU = "lru"
     PREFIX_RECENCY = "prefix_recency"
     LFU = "lfu"
+    ARC = "arc"
     RECURPLAN = "recurplan"
 
 
@@ -57,6 +59,18 @@ class PrefixRetentionObserverState:
     generation: int
     completed_ordinal: int
     metadata: tuple[PrefixRetentionMetadataState, ...]
+    arc_state: "PrefixRetentionARCState"
+
+
+@dataclass(frozen=True)
+class PrefixRetentionARCState:
+    """Bounded adaptive-replacement metadata, ordered least to most recent."""
+
+    target_t1: int
+    t1_lru_to_mru: tuple[BlockHashWithGroupId, ...]
+    t2_lru_to_mru: tuple[BlockHashWithGroupId, ...]
+    b1_lru_to_mru: tuple[BlockHashWithGroupId, ...]
+    b2_lru_to_mru: tuple[BlockHashWithGroupId, ...]
 
 
 @dataclass
@@ -91,6 +105,11 @@ class PrefixRetentionTracker:
         self.completed_ordinal = 0
         self._generation = 0
         self._metadata: dict[BlockHashWithGroupId, _MutableMetadata] = {}
+        self._arc_target_t1 = 0
+        self._arc_t1: OrderedDict[BlockHashWithGroupId, None] = OrderedDict()
+        self._arc_t2: OrderedDict[BlockHashWithGroupId, None] = OrderedDict()
+        self._arc_b1: OrderedDict[BlockHashWithGroupId, None] = OrderedDict()
+        self._arc_b2: OrderedDict[BlockHashWithGroupId, None] = OrderedDict()
 
     def register_chain(self, block_hashes: Sequence[BlockHashWithGroupId]) -> bool:
         if not block_hashes:
@@ -135,8 +154,93 @@ class PrefixRetentionTracker:
                     metadata.gaps = (*metadata.gaps, gap)[-4:]
             metadata.completed_count += 1
             metadata.last_access_ordinal = ordinal
+            if self.policy in (
+                PrefixRetentionPolicy.ARC,
+                PrefixRetentionPolicy.RECURPLAN,
+            ):
+                self._arc_access(key)
         self.completed_ordinal = ordinal
         return True
+
+    def arc_state(self) -> PrefixRetentionARCState:
+        return PrefixRetentionARCState(
+            target_t1=self._arc_target_t1,
+            t1_lru_to_mru=tuple(self._arc_t1),
+            t2_lru_to_mru=tuple(self._arc_t2),
+            b1_lru_to_mru=tuple(self._arc_b1),
+            b2_lru_to_mru=tuple(self._arc_b2),
+        )
+
+    def _arc_access(self, key: BlockHashWithGroupId) -> None:
+        capacity = self.budget_blocks
+        if capacity <= 0:
+            return
+
+        if key in self._arc_t1:
+            del self._arc_t1[key]
+            self._arc_t2[key] = None
+        elif key in self._arc_t2:
+            self._arc_t2.move_to_end(key)
+        elif key in self._arc_b1:
+            delta = max(1, len(self._arc_b2) // max(len(self._arc_b1), 1))
+            self._arc_target_t1 = min(capacity, self._arc_target_t1 + delta)
+            self._arc_replace(key)
+            del self._arc_b1[key]
+            self._arc_t2[key] = None
+        elif key in self._arc_b2:
+            delta = max(1, len(self._arc_b1) // max(len(self._arc_b2), 1))
+            self._arc_target_t1 = max(0, self._arc_target_t1 - delta)
+            self._arc_replace(key)
+            del self._arc_b2[key]
+            self._arc_t2[key] = None
+        else:
+            if len(self._arc_t1) + len(self._arc_b1) == capacity:
+                if len(self._arc_t1) < capacity:
+                    self._arc_b1.popitem(last=False)
+                    self._arc_replace(key)
+                else:
+                    victim, _ = self._arc_t1.popitem(last=False)
+                    self._arc_b1[victim] = None
+            elif (
+                len(self._arc_t1)
+                + len(self._arc_t2)
+                + len(self._arc_b1)
+                + len(self._arc_b2)
+                >= capacity
+            ):
+                total = (
+                    len(self._arc_t1)
+                    + len(self._arc_t2)
+                    + len(self._arc_b1)
+                    + len(self._arc_b2)
+                )
+                if total >= 2 * capacity and self._arc_b2:
+                    self._arc_b2.popitem(last=False)
+                self._arc_replace(key)
+            self._arc_t1[key] = None
+        self._trim_arc_ghosts()
+
+    def _arc_replace(self, incoming: BlockHashWithGroupId) -> None:
+        choose_t1 = bool(self._arc_t1) and (
+            len(self._arc_t1) > self._arc_target_t1
+            or (incoming in self._arc_b2 and len(self._arc_t1) == self._arc_target_t1)
+        )
+        if choose_t1:
+            victim, _ = self._arc_t1.popitem(last=False)
+            self._arc_b1[victim] = None
+        elif self._arc_t2:
+            victim, _ = self._arc_t2.popitem(last=False)
+            self._arc_b2[victim] = None
+
+    def _trim_arc_ghosts(self) -> None:
+        capacity = self.budget_blocks
+        while len(self._arc_b1) + len(self._arc_b2) > capacity:
+            if len(self._arc_b1) > self._arc_target_t1:
+                self._arc_b1.popitem(last=False)
+            elif self._arc_b2:
+                self._arc_b2.popitem(last=False)
+            else:
+                self._arc_b1.popitem(last=False)
 
     def snapshot(
         self, resident_hashes: Sequence[BlockHashWithGroupId]
@@ -180,6 +284,7 @@ class PrefixRetentionTracker:
             generation=self._generation,
             completed_ordinal=self.completed_ordinal,
             metadata=metadata,
+            arc_state=self.arc_state(),
         )
 
     def protected_hashes(
@@ -276,27 +381,60 @@ class PrefixRetentionTracker:
                 *canonical,
             )
 
+        if self.policy is PrefixRetentionPolicy.ARC:
+            return self._arc_ranking(terminal, marginal_cost)
+
         timing_score = self._timing_score(metadata, snapshot.completed_ordinal)
-        if timing_score == 0:
-            return None
+        if timing_score is None:
+            arc_ranking = self._arc_ranking(terminal, marginal_cost)
+            return None if arc_ranking is None else (1, *arc_ranking)
         value = timing_score * terminal_depth * snapshot.hash_block_size / marginal_cost
-        return (-value, marginal_cost, *canonical)
+        return (0, -value, marginal_cost, *canonical)
+
+    def _arc_ranking(
+        self, terminal: BlockHashWithGroupId, marginal_cost: int
+    ) -> tuple[object, ...] | None:
+        canonical = _canonical_key(terminal)
+        if terminal in self._arc_t2:
+            recency = tuple(reversed(self._arc_t2)).index(terminal)
+            within_target = recency < max(self.budget_blocks - self._arc_target_t1, 0)
+            return (0 if within_target else 2, recency, marginal_cost, *canonical)
+        if terminal in self._arc_t1:
+            recency = tuple(reversed(self._arc_t1)).index(terminal)
+            within_target = recency < self._arc_target_t1
+            return (0 if within_target else 1, recency, marginal_cost, *canonical)
+        return None
 
     @staticmethod
-    def _timing_score(metadata: _PrefixMetadata, completed_ordinal: int) -> Fraction:
+    def _timing_score(
+        metadata: _PrefixMetadata, completed_ordinal: int
+    ) -> Fraction | None:
         if len(metadata.gaps) < 3:
-            return Fraction(0)
+            return None
         gaps = sorted(metadata.gaps)
         middle = len(gaps) // 2
         if len(gaps) % 2:
             median = Fraction(gaps[middle])
         else:
             median = Fraction(gaps[middle - 1] + gaps[middle], 2)
+        dispersion = max(abs(Fraction(gap) - median) for gap in gaps)
+        if dispersion > max(Fraction(1), median):
+            return None
         age = completed_ordinal - metadata.last_access_ordinal
+        uncertainty_radius = max(Fraction(1), dispersion)
+        if not max(Fraction(1), median - uncertainty_radius) <= age <= (
+            median + uncertainty_radius
+        ):
+            return None
         score = Fraction(1) - abs(Fraction(age) - median) / max(median, Fraction(1))
-        return max(Fraction(0), score)
+        return score if score > 0 else None
 
     def reset(self) -> None:
         self._metadata.clear()
         self.completed_ordinal = 0
+        self._arc_target_t1 = 0
+        self._arc_t1.clear()
+        self._arc_t2.clear()
+        self._arc_b1.clear()
+        self._arc_b2.clear()
         self._generation += 1

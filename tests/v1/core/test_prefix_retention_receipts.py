@@ -247,6 +247,49 @@ def test_protection_receipt_freezes_candidate_classes_before_selection():
     assert [item.block_id for item in receipt.victims] == [2]
 
 
+def test_arc_receipt_freezes_complete_adaptive_state():
+    tracker = PrefixRetentionTracker(
+        policy=PrefixRetentionPolicy.ARC,
+        budget_blocks=2,
+        hash_block_size=4,
+    )
+    pool = BlockPool(
+        num_gpu_blocks=5,
+        enable_caching=True,
+        hash_block_size=4,
+        prefix_retention_tracker=tracker,
+        enable_prefix_retention_observer=True,
+    )
+    first, second, third = (_key(raw, 0) for raw in (b"a", b"b", b"c"))
+    for key in (first, second, third):
+        assert tracker.register_chain([key])
+    for key in (first, second, third, first):
+        assert tracker.record_completed_access([key])
+    for block_id, key in enumerate((first, second, third), start=1):
+        _cache(pool, block_id, key)
+    state = tracker.arc_state()
+    protected = tracker.protected_hashes(
+        tracker.snapshot(pool.get_resident_cached_hashes())
+    )
+
+    pool.get_new_blocks(1, protected_hashes=protected, request_id="arc-state")
+
+    receipt = _receipts(pool)[0]
+    assert receipt.arc_preimage.target_t1 == state.target_t1
+    assert receipt.arc_preimage.t1_hashes_hex == tuple(
+        bytes(key).hex() for key in state.t1_lru_to_mru
+    )
+    assert receipt.arc_preimage.t2_hashes_hex == tuple(
+        bytes(key).hex() for key in state.t2_lru_to_mru
+    )
+    assert receipt.arc_preimage.b1_hashes_hex == tuple(
+        bytes(key).hex() for key in state.b1_lru_to_mru
+    )
+    assert receipt.arc_preimage.b2_hashes_hex == tuple(
+        bytes(key).hex() for key in state.b2_lru_to_mru
+    )
+
+
 def test_receipt_append_occurs_after_normal_eviction_mutations(monkeypatch):
     pool = BlockPool(
         num_gpu_blocks=3,

@@ -36,7 +36,9 @@ CacheDType = Literal[
 MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
-PrefixRetentionPolicyName = Literal["lru", "prefix_recency", "lfu", "recurplan"]
+PrefixRetentionPolicyName = Literal[
+    "lru", "prefix_recency", "lfu", "arc", "recurplan"
+]
 KVOffloadingBackend = Literal["native", "lmcache"]
 
 

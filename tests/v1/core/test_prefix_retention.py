@@ -128,6 +128,75 @@ def test_lfu_prefers_count_before_recency():
     assert tracker.protected_hashes(tracker.snapshot([frequent, recent])) == {frequent}
 
 
+def test_arc_promotes_repeated_access_and_bounds_ghost_history():
+    first, second = _hash(b"a"), _hash(b"b")
+    tracker = _tracker(PrefixRetentionPolicy.ARC, budget=2)
+    for key in (first, second):
+        assert tracker.register_chain([key])
+
+    assert tracker.record_completed_access([first])
+    assert tracker.record_completed_access([second])
+    assert tracker.record_completed_access([first])
+
+    state = tracker.arc_state()
+    assert state.t1_lru_to_mru == (second,)
+    assert state.t2_lru_to_mru == (first,)
+    assert state.b1_lru_to_mru == ()
+    assert state.b2_lru_to_mru == ()
+    assert len(state.t1_lru_to_mru) + len(state.t2_lru_to_mru) <= 2
+
+
+def test_arc_ghost_hits_move_the_adaptive_partition_both_directions():
+    a, b, c, d = (_hash(raw) for raw in (b"a", b"b", b"c", b"d"))
+    tracker = _tracker(PrefixRetentionPolicy.ARC, budget=2)
+    for key in (a, b, c, d):
+        assert tracker.register_chain([key])
+
+    for key in (a, b, c):
+        assert tracker.record_completed_access([key])
+    before_b1_hit = tracker.arc_state()
+    assert a in before_b1_hit.b1_lru_to_mru
+    assert before_b1_hit.target_t1 == 0
+
+    assert tracker.record_completed_access([a])
+    after_b1_hit = tracker.arc_state()
+    assert after_b1_hit.target_t1 == 1
+    assert a in after_b1_hit.t2_lru_to_mru
+
+    assert tracker.record_completed_access([d])
+    before_b2_hit = tracker.arc_state()
+    assert a in before_b2_hit.b2_lru_to_mru
+    assert tracker.record_completed_access([a])
+    after_b2_hit = tracker.arc_state()
+    assert after_b2_hit.target_t1 == 0
+    assert a in after_b2_hit.t2_lru_to_mru
+
+    resident = set(after_b2_hit.t1_lru_to_mru + after_b2_hit.t2_lru_to_mru)
+    ghosts = set(after_b2_hit.b1_lru_to_mru + after_b2_hit.b2_lru_to_mru)
+    assert resident.isdisjoint(ghosts)
+    assert len(resident) <= 2
+    assert len(ghosts) <= 2
+
+
+def test_arc_reset_and_victim_order_are_deterministic():
+    a, b, c = (_hash(raw) for raw in (b"a", b"b", b"c"))
+    tracker = _tracker(PrefixRetentionPolicy.ARC, budget=2)
+    for key in (c, b, a):
+        assert tracker.register_chain([key])
+        assert tracker.record_completed_access([key])
+    assert tracker.record_completed_access([a])
+
+    expected = tracker.protected_hashes(tracker.snapshot([c, b, a]))
+    assert expected == {a, b}
+    assert tracker.protected_hashes(tracker.snapshot([a, b, c])) == expected
+
+    tracker.reset()
+    state = tracker.arc_state()
+    assert state.t1_lru_to_mru == state.t2_lru_to_mru == ()
+    assert state.b1_lru_to_mru == state.b2_lru_to_mru == ()
+    assert state.target_t1 == 0
+
+
 def test_completed_access_deduplicates_identities_before_atomic_validation():
     root, child, unknown = _hash(b"a"), _hash(b"b"), _hash(b"x")
     tracker = _tracker(PrefixRetentionPolicy.LFU, budget=2)
@@ -169,14 +238,38 @@ def test_recurplan_uses_frozen_ordinal_gap_score():
     assert tracker.protected_hashes(tracker.snapshot([periodic, early])) == {periodic}
 
 
-def test_recurplan_does_not_select_fewer_than_three_completed_gaps():
+def test_recurplan_falls_back_to_arc_with_fewer_than_three_completed_gaps():
     key = _hash(b"a")
     tracker = _tracker(PrefixRetentionPolicy.RECURPLAN, budget=1)
     assert tracker.register_chain([key])
     for _ in range(3):
         assert tracker.record_completed_access([key])
 
-    assert tracker.protected_hashes(tracker.snapshot([key])) == frozenset()
+    assert tracker.protected_hashes(tracker.snapshot([key])) == {key}
+
+
+def test_recurplan_rejects_drifting_and_stale_interval_predictions():
+    changed, stale, filler = _hash(b"a"), _hash(b"b"), _hash(b"z")
+    tracker = _tracker(PrefixRetentionPolicy.RECURPLAN, budget=2)
+    for key in (changed, stale, filler):
+        assert tracker.register_chain([key])
+
+    changed_ordinals = {1, 2, 11, 12}
+    stale_ordinals = {3, 5, 7, 9}
+    for ordinal in range(1, 20):
+        if ordinal in changed_ordinals:
+            key = changed
+        elif ordinal in stale_ordinals:
+            key = stale
+        else:
+            key = filler
+        assert tracker.record_completed_access([key])
+
+    snapshot = tracker.snapshot([changed, stale])
+    metadata = {item.block_hash: item for item in snapshot.metadata}
+    assert tracker._timing_score(metadata[changed], snapshot.completed_ordinal) is None
+    assert tracker._timing_score(metadata[stale], snapshot.completed_ordinal) is None
+    assert tracker.protected_hashes(snapshot)
 
 
 def test_recurplan_even_median_is_deterministic():

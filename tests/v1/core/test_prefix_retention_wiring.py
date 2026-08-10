@@ -44,6 +44,16 @@ def test_prefix_retention_cli_args():
             ]
         )
     )
+    arc = EngineArgs.from_cli_args(
+        parser.parse_args(
+            [
+                "--prefix-retention-policy",
+                "arc",
+                "--prefix-retention-budget-blocks",
+                "7",
+            ]
+        )
+    )
 
     assert defaults.prefix_retention_policy == "lru"
     assert defaults.prefix_retention_budget_blocks == 0
@@ -53,6 +63,8 @@ def test_prefix_retention_cli_args():
     assert configured.prefix_retention_budget_blocks == 7
     assert configured.enable_prefix_retention_observer is True
     assert configured.prefix_retention_observer_capacity == 19
+    assert arc.prefix_retention_policy == "arc"
+    assert arc.prefix_retention_budget_blocks == 7
 
 
 def _make_gate_inputs(
@@ -189,6 +201,7 @@ def _make_real_scheduler_inputs(
         ("lru", 0),
         ("prefix_recency", 2),
         ("lfu", 2),
+        ("arc", 2),
         ("recurplan", 2),
     ],
 )
