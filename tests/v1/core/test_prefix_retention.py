@@ -238,6 +238,20 @@ def test_recurplan_uses_frozen_ordinal_gap_score():
     assert tracker.protected_hashes(tracker.snapshot([periodic, early])) == {periodic}
 
 
+def test_recurplan_protects_a_reliable_recurrence_before_it_is_due():
+    recurring, filler = _hash(b"a"), _hash(b"z")
+    tracker = _tracker(PrefixRetentionPolicy.RECURPLAN, budget=1)
+    for key in (recurring, filler):
+        assert tracker.register_chain([key])
+    for ordinal in range(1, 15):
+        key = recurring if ordinal in {1, 5, 9, 13} else filler
+        assert tracker.record_completed_access([key])
+
+    assert tracker.protected_hashes(tracker.snapshot([recurring, filler])) == {
+        recurring
+    }
+
+
 def test_recurplan_falls_back_to_arc_with_fewer_than_three_completed_gaps():
     key = _hash(b"a")
     tracker = _tracker(PrefixRetentionPolicy.RECURPLAN, budget=1)

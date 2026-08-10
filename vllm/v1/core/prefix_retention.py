@@ -422,9 +422,7 @@ class PrefixRetentionTracker:
             return None
         age = completed_ordinal - metadata.last_access_ordinal
         uncertainty_radius = max(Fraction(1), dispersion)
-        if not max(Fraction(1), median - uncertainty_radius) <= age <= (
-            median + uncertainty_radius
-        ):
+        if age > median + uncertainty_radius:
             return None
         score = Fraction(1) - abs(Fraction(age) - median) / max(median, Fraction(1))
         return score if score > 0 else None
