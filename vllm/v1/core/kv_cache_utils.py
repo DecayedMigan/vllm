@@ -300,7 +300,8 @@ class FreeKVCacheBlockQueue:
         Args:
             n: The number of blocks to pop.
             protected_hashes: Group-aware cached block identities to prefer
-                retaining.
+                retaining. At most one physical instance per identity is put
+                in the protected tier.
 
         Returns:
             A list of n free blocks in stable tier and LRU order.
@@ -308,6 +309,12 @@ class FreeKVCacheBlockQueue:
         if n == 0:
             return []
         assert self.num_free_blocks >= n
+
+        representatives: dict[BlockHashWithGroupId, int] = {}
+        for block in self.get_all_free_blocks():
+            if block.block_hash in protected_hashes:
+                representatives[block.block_hash] = block.block_id
+        protected_block_ids = frozenset(representatives.values())
 
         ret: list[KVCacheBlock] = []
         for category in range(3):
@@ -325,10 +332,14 @@ class FreeKVCacheBlockQueue:
                     selected = block_hash is None
                 elif category == 1:
                     selected = (
-                        block_hash is not None and block_hash not in protected_hashes
+                        block_hash is not None
+                        and curr_block.block_id not in protected_block_ids
                     )
                 else:
-                    selected = block_hash is not None and block_hash in protected_hashes
+                    selected = (
+                        block_hash is not None
+                        and curr_block.block_id in protected_block_ids
+                    )
                 if selected:
                     self.remove(curr_block)
                     ret.append(curr_block)

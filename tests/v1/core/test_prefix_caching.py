@@ -2335,7 +2335,7 @@ def test_protected_eviction_preserves_maps_metrics_and_removal_events():
         protected_hashes=frozenset({protected_duplicate, protected_other}),
     )
 
-    assert [block.block_id for block in selected] == [2, 5, 3, 6, 1]
+    assert [block.block_id for block in selected] == [2, 5, 1, 3, 6]
     assert len({block.block_id for block in selected}) == 5
     assert pool.get_num_free_blocks() == initial_free - len(selected) == 2
     assert all(block.ref_cnt == 1 for block in selected)
@@ -2362,9 +2362,9 @@ def test_protected_eviction_preserves_maps_metrics_and_removal_events():
             get_group_id(block_hash),
         )
         for block_hash in (
+            protected_duplicate,
             unprotected_first,
             unprotected_second,
-            protected_duplicate,
         )
     ]
 

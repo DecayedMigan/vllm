@@ -242,14 +242,14 @@ class BlockPool:
     def _prefix_retention_preimage(
         block: KVCacheBlock,
         queue_ordinal: int,
-        protected_hashes: AbstractSet[BlockHashWithGroupId],
+        protected_block_ids: AbstractSet[int],
     ) -> PrefixRetentionBlockPreimage:
         block_hash = block.block_hash
         if block_hash is None:
             category = PrefixRetentionBlockCategory.UNHASHED
             block_hash_hex = None
             group_id = None
-        elif block_hash in protected_hashes:
+        elif block.block_id in protected_block_ids:
             category = PrefixRetentionBlockCategory.PROTECTED_CACHED
             block_hash_hex = bytes(block_hash).hex()
             group_id = get_group_id(block_hash)
@@ -265,9 +265,26 @@ class BlockPool:
             category=category,
         )
 
+    def _physical_protected_block_ids(
+        self,
+        protected_hashes: AbstractSet[BlockHashWithGroupId],
+    ) -> frozenset[int]:
+        """Choose one deterministic physical representative per logical key.
+
+        Duplicate cached copies remain ordinary eviction candidates. The most
+        recent free-queue instance is retained for each protected key, so the
+        physical protection count can never exceed the logical key budget.
+        """
+        representatives: dict[BlockHashWithGroupId, int] = {}
+        for block in self.free_block_queue.get_all_free_blocks():
+            if block.block_hash in protected_hashes:
+                representatives[block.block_hash] = block.block_id
+        return frozenset(representatives.values())
+
     def _capture_prefix_retention_preimage(
         self,
         protected_hashes: AbstractSet[BlockHashWithGroupId],
+        protected_block_ids: AbstractSet[int],
     ) -> tuple[
         tuple[PrefixRetentionBlockPreimage, ...],
         tuple[PrefixRetentionTrackerMetadataPreimage, ...],
@@ -278,7 +295,9 @@ class BlockPool:
         int,
     ]:
         candidates = tuple(
-            self._prefix_retention_preimage(block, queue_ordinal, protected_hashes)
+            self._prefix_retention_preimage(
+                block, queue_ordinal, protected_block_ids
+            )
             for queue_ordinal, block in enumerate(
                 self.free_block_queue.get_all_free_blocks()
             )
@@ -557,6 +576,11 @@ class BlockPool:
             return []
 
         buffer = self._prefix_retention_receipt_buffer
+        protected_block_ids = (
+            self._physical_protected_block_ids(protected_hashes)
+            if buffer is not None and protected_hashes
+            else frozenset()
+        )
         if buffer is None:
             if not protected_hashes:
                 ret = self.free_block_queue.popleft_n(num_blocks)
@@ -598,7 +622,9 @@ class BlockPool:
                 budget_blocks,
                 tracker_generation,
                 completed_ordinal,
-            ) = self._capture_prefix_retention_preimage(frozen_protected_hashes)
+            ) = self._capture_prefix_retention_preimage(
+                frozen_protected_hashes, protected_block_ids
+            )
         except Exception:
             buffer.mark_failed()
 

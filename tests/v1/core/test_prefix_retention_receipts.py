@@ -633,7 +633,7 @@ def test_selected_preimage_failure_cannot_interrupt_eviction_mutation(monkeypatc
     assert batch.dropped_count == 1
 
 
-def test_receipt_preserves_duplicate_physical_instances_for_one_protected_key():
+def test_one_physical_instance_is_protected_for_each_logical_key():
     pool = BlockPool(
         num_gpu_blocks=4,
         enable_caching=True,
@@ -646,25 +646,25 @@ def test_receipt_preserves_duplicate_physical_instances_for_one_protected_key():
     _cache(pool, 2, duplicate)
 
     selected = pool.get_new_blocks(
-        3,
+        2,
         protected_hashes=frozenset({duplicate}),
         request_id="duplicate-physical",
     )
     (receipt,) = _receipts(pool)
     removed = [event for event in pool.take_events() if isinstance(event, BlockRemoved)]
 
-    assert [block.block_id for block in selected] == [3, 1, 2]
+    assert [block.block_id for block in selected] == [3, 1]
     assert receipt.protected_hashes_hex == (bytes(duplicate).hex(),)
     protected_instances = [
         item
         for item in receipt.candidates
         if item.category is PrefixRetentionBlockCategory.PROTECTED_CACHED
     ]
-    assert [item.block_id for item in protected_instances] == [1, 2]
-    assert [item.group_id for item in protected_instances] == [14, 14]
+    assert [item.block_id for item in protected_instances] == [2]
+    assert [item.group_id for item in protected_instances] == [14]
     assert [item.block_hash_hex for item in protected_instances] == [
         bytes(duplicate).hex(),
-        bytes(duplicate).hex(),
     ]
-    assert [item.block_id for item in receipt.victims] == [1, 2]
-    assert len(removed) == len(receipt.victims) == 2
+    assert [item.block_id for item in receipt.victims] == [1]
+    assert len(removed) == len(receipt.victims) == 1
+    assert pool.cached_block_hash_to_block.get_one_block(duplicate) is pool.blocks[2]
