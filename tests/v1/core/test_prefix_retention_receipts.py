@@ -4,6 +4,7 @@
 
 import asyncio
 from dataclasses import FrozenInstanceError
+from typing import get_args
 from unittest.mock import Mock
 
 import pytest
@@ -25,9 +26,13 @@ from vllm.v1.core.prefix_retention_observer import (
     PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION,
     PrefixRetentionBlockCategory,
     PrefixRetentionCompletedAccessReceipt,
+    PrefixRetentionDecisionReceipt,
     PrefixRetentionHashPreimage,
+    PrefixRetentionLocalState,
+    PrefixRetentionReceipt,
     PrefixRetentionReceiptBatch,
     PrefixRetentionResetReceipt,
+    PrefixRetentionRuntimeConfigReceipt,
 )
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.engine.core import EngineCoreProc
@@ -92,9 +97,7 @@ def test_multiprocess_utility_bypasses_are_rejected_before_transport():
         SyncMPClient.call_utility(Mock(), "take_prefix_retention_receipts")
 
     async def invoke_async_bypass() -> None:
-        with pytest.raises(
-            ValueError, match="prefix_retention_receipts_inproc_only"
-        ):
+        with pytest.raises(ValueError, match="prefix_retention_receipts_inproc_only"):
             await AsyncMPClient.call_utility_async(
                 Mock(), "take_prefix_retention_receipts"
             )
@@ -102,22 +105,84 @@ def test_multiprocess_utility_bypasses_are_rejected_before_transport():
     asyncio.run(invoke_async_bypass())
 
 
-def test_reset_receipt_is_immutable_and_part_of_the_observer_union():
-    receipt = PrefixRetentionResetReceipt(
-        schema_version=PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION,
-        reset_running_requests=False,
-        connector_reset_requested=True,
-        local_cache_reset=True,
-        tracker_history_reset=True,
-        connector_reset_successful=True,
-        tracker_generation_before=2,
-        tracker_generation_after=3,
-        reset_successful=True,
+def test_runtime_config_receipt_is_immutable():
+    runtime = PrefixRetentionRuntimeConfigReceipt(
+        schema_version="amd-kv-retention-observer-v2",
+        policy="recurplan",
+        budget_blocks=31,
+        prefix_caching_enabled=True,
+        scheduler_block_size=16,
+        hash_block_size=16,
+        num_gpu_blocks=97,
+        num_kv_groups=1,
+        capability_mode="non_lru_envelope_passed",
+        tracker_binding_verified=True,
+        observer_enabled=True,
+        observer_capacity=256,
     )
 
-    assert receipt.reset_successful is True
+    assert PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION == ("amd-kv-retention-observer-v2")
+    assert runtime.policy == "recurplan"
     with pytest.raises(FrozenInstanceError):
-        receipt.reset_successful = False  # type: ignore[misc]
+        runtime.policy = "lru"  # type: ignore[misc]
+
+
+def test_local_state_receipt_is_immutable():
+    state = PrefixRetentionLocalState(
+        non_null_used_blocks=0,
+        resident_key_count=0,
+        hashed_physical_block_count=0,
+        tracker_generation=1,
+        tracker_completed_ordinal=0,
+        tracker_metadata_count=0,
+    )
+
+    assert state.tracker_generation == 1
+    with pytest.raises(FrozenInstanceError):
+        state.tracker_generation = 2  # type: ignore[misc]
+
+
+def test_expanded_reset_receipt_is_immutable_and_union_is_closed():
+    state = PrefixRetentionLocalState(
+        non_null_used_blocks=0,
+        resident_key_count=0,
+        hashed_physical_block_count=0,
+        tracker_generation=1,
+        tracker_completed_ordinal=0,
+        tracker_metadata_count=0,
+    )
+    reset = PrefixRetentionResetReceipt(
+        schema_version="amd-kv-retention-observer-v2",
+        attempt_ordinal=1,
+        reset_running_requests_requested=False,
+        reset_connector_requested=False,
+        running_requests_before=0,
+        preempted_requests=0,
+        running_requests_after=0,
+        local_reset_attempted=True,
+        local_reset_succeeded=True,
+        connector_configured=False,
+        connector_reset_attempted=False,
+        connector_reset_succeeded=None,
+        overall_succeeded=True,
+        reason_tokens=(),
+        local_state_before=state,
+        local_state_after=state,
+        all_blocks_cleared_emitted=False,
+    )
+
+    assert reset.local_state_before is state
+    assert reset.local_state_after is state
+    assert frozenset(get_args(PrefixRetentionReceipt)) == frozenset(
+        {
+            PrefixRetentionRuntimeConfigReceipt,
+            PrefixRetentionDecisionReceipt,
+            PrefixRetentionCompletedAccessReceipt,
+            PrefixRetentionResetReceipt,
+        }
+    )
+    with pytest.raises(FrozenInstanceError):
+        reset.overall_succeeded = False  # type: ignore[misc]
 
 
 def _full_attention_manager(pool: BlockPool) -> FullAttentionManager:

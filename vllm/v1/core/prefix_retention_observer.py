@@ -7,7 +7,7 @@ import json
 from dataclasses import asdict, dataclass
 from enum import Enum
 
-PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION = "amd-kv-retention-observer-v1"
+PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION = "amd-kv-retention-observer-v2"
 
 
 class PrefixRetentionBlockCategory(str, Enum):
@@ -125,22 +125,57 @@ class PrefixRetentionCompletedAccessReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class PrefixRetentionRuntimeConfigReceipt:
+    schema_version: str
+    policy: str
+    budget_blocks: int
+    prefix_caching_enabled: bool
+    scheduler_block_size: int
+    hash_block_size: int
+    num_gpu_blocks: int
+    num_kv_groups: int
+    capability_mode: str
+    tracker_binding_verified: bool
+    observer_enabled: bool
+    observer_capacity: int
+
+
+@dataclass(frozen=True, slots=True)
+class PrefixRetentionLocalState:
+    non_null_used_blocks: int
+    resident_key_count: int
+    hashed_physical_block_count: int
+    tracker_generation: int
+    tracker_completed_ordinal: int
+    tracker_metadata_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class PrefixRetentionResetReceipt:
     """Outcome of one cache reset without changing the legacy bool contract."""
 
     schema_version: str
-    reset_running_requests: bool
-    connector_reset_requested: bool
-    local_cache_reset: bool
-    tracker_history_reset: bool
-    connector_reset_successful: bool | None
-    tracker_generation_before: int
-    tracker_generation_after: int
-    reset_successful: bool
+    attempt_ordinal: int
+    reset_running_requests_requested: bool
+    reset_connector_requested: bool
+    running_requests_before: int
+    preempted_requests: int
+    running_requests_after: int
+    local_reset_attempted: bool
+    local_reset_succeeded: bool
+    connector_configured: bool
+    connector_reset_attempted: bool
+    connector_reset_succeeded: bool | None
+    overall_succeeded: bool
+    reason_tokens: tuple[str, ...]
+    local_state_before: PrefixRetentionLocalState | None
+    local_state_after: PrefixRetentionLocalState | None
+    all_blocks_cleared_emitted: bool
 
 
 PrefixRetentionReceipt = (
-    PrefixRetentionDecisionReceipt
+    PrefixRetentionRuntimeConfigReceipt
+    | PrefixRetentionDecisionReceipt
     | PrefixRetentionCompletedAccessReceipt
     | PrefixRetentionResetReceipt
 )
