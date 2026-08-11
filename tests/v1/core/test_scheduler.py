@@ -132,6 +132,7 @@ def _make_stub_prefix_reset_scheduler(
     ),
     emit_all_blocks_cleared: tuple[bool, ...] = (False,),
     connector_outcomes: tuple[bool | Exception, ...] | None = None,
+    enable_observer: bool = True,
 ) -> tuple[
     Scheduler,
     _PrefixResetManagerStub,
@@ -142,7 +143,7 @@ def _make_stub_prefix_reset_scheduler(
         num_gpu_blocks=3,
         enable_caching=True,
         hash_block_size=4,
-        enable_prefix_retention_observer=True,
+        enable_prefix_retention_observer=enable_observer,
     )
     manager = _PrefixResetManagerStub(
         block_pool,
@@ -186,6 +187,29 @@ def _make_stub_running_request(
         num_output_placeholders=num_output_placeholders,
         async_tokens_to_discard=0,
     )
+
+
+def _forbid_disabled_reset_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    manager: _PrefixResetManagerStub,
+) -> Mock:
+    """Install tripwires for every receipt-only read/write path."""
+    forbidden = Mock(
+        side_effect=AssertionError("disabled reset must not capture receipt evidence")
+    )
+    monkeypatch.setattr(manager, "prefix_retention_local_state", forbidden)
+    monkeypatch.setattr(manager.block_pool, "prefix_retention_pool_state", forbidden)
+    monkeypatch.setattr(manager.block_pool, "record_prefix_retention_reset", forbidden)
+    monkeypatch.setattr(
+        "vllm.v1.core.sched.scheduler.PrefixRetentionResetReceipt", forbidden
+    )
+
+    # Local reset remains free to publish events, but receipt-only code must not
+    # inspect the queue length or slice its delta. ``Mock`` supports ``append``
+    # while deliberately failing ``len(...)`` and subscription.
+    event_queue = Mock()
+    monkeypatch.setattr(manager.block_pool, "kv_event_queue", event_queue)
+    return event_queue
 
 
 def test_add_requests():
@@ -982,6 +1006,179 @@ def test_preempt_during_execution():
     # sampled token id.
     assert len(requests[1].output_token_ids) == 1
     assert requests[1].output_token_ids[0] == 42
+
+
+@pytest.mark.parametrize("enable_observer", [True, False])
+def test_prefix_reset_observer_gate_is_public_and_constant_time(
+    enable_observer: bool,
+):
+    scheduler, _, _, _ = _make_stub_prefix_reset_scheduler(
+        enable_observer=enable_observer
+    )
+
+    assert (
+        scheduler.kv_cache_manager.block_pool.prefix_retention_observer_enabled
+        is enable_observer
+    )
+
+
+@pytest.mark.parametrize(
+    ("local_outcome", "emit_all_blocks_cleared", "expected"),
+    [
+        pytest.param(True, True, True, id="success"),
+        pytest.param(False, False, False, id="local-failure"),
+    ],
+)
+def test_disabled_reset_public_bool_bypasses_receipt_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    local_outcome: bool,
+    emit_all_blocks_cleared: bool,
+    expected: bool,
+):
+    scheduler, manager, _, _ = _make_stub_prefix_reset_scheduler(
+        local_outcomes=(local_outcome,),
+        emit_all_blocks_cleared=(emit_all_blocks_cleared,),
+        enable_observer=False,
+    )
+    event_queue = _forbid_disabled_reset_evidence(monkeypatch, manager)
+
+    # Requesting a connector reset without a configured connector remains the
+    # legacy no-op success and must not force receipt evidence collection.
+    assert scheduler.reset_prefix_cache(reset_connector=True) is expected
+
+    assert manager.reset_calls == 1
+    assert manager.state_calls == 0
+    assert scheduler._prefix_reset_attempt_ordinal == 0
+    if emit_all_blocks_cleared:
+        event_queue.append.assert_called_once()
+    else:
+        event_queue.append.assert_not_called()
+    batch = scheduler.take_prefix_retention_receipts()
+    assert batch.observer_enabled is False
+    assert batch.receipts == ()
+
+
+def test_disabled_reset_public_local_exception_bypasses_receipt_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    local_error = ValueError("local-boom")
+    scheduler, manager, _, _ = _make_stub_prefix_reset_scheduler(
+        local_outcomes=(local_error,),
+        enable_observer=False,
+    )
+    _forbid_disabled_reset_evidence(monkeypatch, manager)
+
+    with pytest.raises(ValueError, match="local-boom") as exc_info:
+        scheduler.reset_prefix_cache(reset_connector=True)
+
+    assert exc_info.value is local_error
+    assert manager.reset_calls == 1
+    assert manager.state_calls == 0
+    assert scheduler._prefix_reset_attempt_ordinal == 0
+
+
+def test_disabled_reset_public_forced_preemption_preserves_exception(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    scheduler, manager, _, waiting_requests = _make_stub_prefix_reset_scheduler(
+        local_outcomes=(False,),
+        enable_observer=False,
+    )
+    _forbid_disabled_reset_evidence(monkeypatch, manager)
+    first = _make_stub_running_request("first", num_output_placeholders=2)
+    second = _make_stub_running_request("second", num_output_placeholders=1)
+    scheduler.running = [first, second]
+    scheduler.prev_step_scheduled_req_ids = {"first", "second"}
+
+    with pytest.raises(RuntimeError, match="Failed to reset KV cache"):
+        scheduler.reset_prefix_cache(reset_running_requests=True)
+
+    assert manager.reset_calls == 1
+    assert manager.state_calls == 0
+    assert scheduler._prefix_reset_attempt_ordinal == 0
+    assert manager.freed_requests == [second, first]
+    assert waiting_requests == [first, second]
+    assert scheduler.running == []
+    assert scheduler.prev_step_scheduled_req_ids == set()
+    assert [first.status, second.status] == [
+        RequestStatus.PREEMPTED,
+        RequestStatus.PREEMPTED,
+    ]
+    assert [first.async_tokens_to_discard, second.async_tokens_to_discard] == [2, 1]
+    assert [first.num_output_placeholders, second.num_output_placeholders] == [0, 0]
+
+
+@pytest.mark.parametrize("connector_outcome", [True, False])
+def test_disabled_reset_public_preserves_connector_result_without_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    connector_outcome: bool,
+):
+    scheduler, manager, connector, _ = _make_stub_prefix_reset_scheduler(
+        connector_outcomes=(connector_outcome,),
+        enable_observer=False,
+    )
+    _forbid_disabled_reset_evidence(monkeypatch, manager)
+
+    assert scheduler.reset_prefix_cache(reset_connector=True) is connector_outcome
+
+    assert connector is not None
+    assert connector.reset_calls == 1
+    assert manager.reset_calls == 1
+    assert manager.state_calls == 0
+    assert scheduler._prefix_reset_attempt_ordinal == 0
+
+
+def test_disabled_reset_public_preserves_connector_exception_without_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    connector_error = RuntimeError("connector-boom")
+    scheduler, manager, connector, _ = _make_stub_prefix_reset_scheduler(
+        connector_outcomes=(connector_error,),
+        enable_observer=False,
+    )
+    _forbid_disabled_reset_evidence(monkeypatch, manager)
+
+    with pytest.raises(RuntimeError, match="connector-boom") as exc_info:
+        scheduler.reset_prefix_cache(reset_connector=True)
+
+    assert exc_info.value is connector_error
+    assert connector is not None
+    assert connector.reset_calls == 1
+    assert manager.reset_calls == 1
+    assert manager.state_calls == 0
+    assert scheduler._prefix_reset_attempt_ordinal == 0
+
+
+def test_disabled_reset_receipt_helper_fails_before_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    scheduler, manager, connector, waiting_requests = _make_stub_prefix_reset_scheduler(
+        connector_outcomes=(True,),
+        enable_observer=False,
+    )
+    _forbid_disabled_reset_evidence(monkeypatch, manager)
+    request = _make_stub_running_request("running", num_output_placeholders=2)
+    scheduler.running = [request]
+    scheduler.prev_step_scheduled_req_ids = {"running"}
+
+    with pytest.raises(RuntimeError, match="prefix_retention_observer_disabled"):
+        scheduler.reset_prefix_cache_with_receipt(
+            reset_running_requests=True,
+            reset_connector=True,
+        )
+
+    assert scheduler.running == [request]
+    assert waiting_requests == []
+    assert manager.reset_calls == 0
+    assert manager.state_calls == 0
+    assert manager.freed_requests == []
+    assert connector is not None
+    assert connector.reset_calls == 0
+    assert scheduler.prev_step_scheduled_req_ids == {"running"}
+    assert request.status is RequestStatus.RUNNING
+    assert request.async_tokens_to_discard == 0
+    assert request.num_output_placeholders == 2
+    assert scheduler._prefix_reset_attempt_ordinal == 0
 
 
 @pytest.mark.parametrize(

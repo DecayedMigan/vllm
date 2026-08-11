@@ -216,6 +216,11 @@ class BlockPool:
         self._prefix_retention_allocation_ordinal = 0
 
     @property
+    def prefix_retention_observer_enabled(self) -> bool:
+        """Whether this pool records prefix-retention receipts."""
+        return self._prefix_retention_receipt_buffer is not None
+
+    @property
     def prefix_retention_observation_failed(self) -> bool:
         buffer = self._prefix_retention_receipt_buffer
         return buffer.observation_failed if buffer is not None else False
