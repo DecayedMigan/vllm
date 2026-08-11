@@ -138,7 +138,23 @@ def test_prefix_recency_is_closure_aware_last_seen_without_period_features():
         ),
     )
     assert tracker.protected_hashes(altered) == expected
-    assert len(expected) == tracker.budget_blocks
+
+    old_chain = frozenset({old_root, old_leaf})
+    adversarial = replace(
+        snapshot,
+        metadata=tuple(
+            replace(
+                item,
+                gaps=(1, 1, 1, 1)
+                if item.block_hash in old_chain
+                else (1, 1000, 1, 1000),
+            )
+            for item in snapshot.metadata
+        ),
+    )
+    protected = tracker.protected_hashes(adversarial)
+    assert protected == expected
+    assert len(protected) == tracker.budget_blocks
 
 
 def test_lfu_prefers_count_before_recency():
