@@ -295,9 +295,7 @@ class BlockPool:
         int,
     ]:
         candidates = tuple(
-            self._prefix_retention_preimage(
-                block, queue_ordinal, protected_block_ids
-            )
+            self._prefix_retention_preimage(block, queue_ordinal, protected_block_ids)
             for queue_ordinal, block in enumerate(
                 self.free_block_queue.get_all_free_blocks()
             )
@@ -414,6 +412,14 @@ class BlockPool:
     def get_resident_cached_hashes(self) -> tuple[BlockHashWithGroupId, ...]:
         """Return a unique, group-aware snapshot without exposing the map."""
         return self.cached_block_hash_to_block.resident_keys()
+
+    def prefix_retention_pool_state(self) -> tuple[int, int, int]:
+        non_null_used = self.num_gpu_blocks - self.get_num_free_blocks() - 1
+        resident_keys = len(self.cached_block_hash_to_block)
+        hashed_physical = sum(
+            block.block_hash is not None and not block.is_null for block in self.blocks
+        )
+        return non_null_used, resident_keys, hashed_physical
 
     def cache_full_blocks(
         self,

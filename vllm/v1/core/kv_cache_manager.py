@@ -18,6 +18,7 @@ from vllm.v1.core.prefix_retention import (
     PrefixRetentionPolicy,
     PrefixRetentionTracker,
 )
+from vllm.v1.core.prefix_retention_observer import PrefixRetentionLocalState
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     get_kv_cache_spec_kind,
@@ -509,6 +510,18 @@ class KVCacheManager:
             block_ids: Set of block IDs to evict from cache.
         """
         self.block_pool.evict_blocks(block_ids)
+
+    def prefix_retention_local_state(self) -> PrefixRetentionLocalState:
+        used, resident, hashed = self.block_pool.prefix_retention_pool_state()
+        tracker = self.prefix_retention_tracker.observation_state()
+        return PrefixRetentionLocalState(
+            non_null_used_blocks=used,
+            resident_key_count=resident,
+            hashed_physical_block_count=hashed,
+            tracker_generation=tracker.generation,
+            tracker_completed_ordinal=tracker.completed_ordinal,
+            tracker_metadata_count=len(tracker.metadata),
+        )
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF

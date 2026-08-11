@@ -39,6 +39,7 @@ from vllm.v1.core.prefix_retention import (
     PrefixRetentionPolicy,
     PrefixRetentionTracker,
 )
+from vllm.v1.core.prefix_retention_observer import PrefixRetentionLocalState
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -2000,6 +2001,112 @@ def test_prefill_not_enough_free_blocks_with_computed_blocks():
     assert {block.ref_cnt for block in block_part1[3:]} == {0}
 
 
+@pytest.fixture
+def manager() -> KVCacheManager:
+    block_size = 4
+    tracker = PrefixRetentionTracker(
+        policy=PrefixRetentionPolicy.RECURPLAN,
+        budget_blocks=2,
+        hash_block_size=block_size,
+    )
+    return make_kv_cache_manager(
+        make_kv_cache_config(block_size, 4),
+        max_model_len=32,
+        enable_caching=True,
+        hash_block_size=block_size,
+        prefix_retention_tracker=tracker,
+    )
+
+
+def _populate_prefix_retention_local_state(
+    manager: KVCacheManager, num_physical_blocks: int
+) -> list[KVCacheBlock]:
+    key = make_block_hash_with_group_id(BlockHash(b"local-state"), 3)
+    tracker = manager.prefix_retention_tracker
+    assert tracker.register_chain([key])
+    assert tracker.record_completed_access([key])
+    blocks = manager.block_pool.get_new_blocks(num_physical_blocks)
+    for block in blocks:
+        block.block_hash = key
+        manager.block_pool.cached_block_hash_to_block.insert(key, block)
+    return blocks
+
+
+def test_empty_local_state_is_exact(manager: KVCacheManager):
+    assert manager.prefix_retention_local_state() == PrefixRetentionLocalState(
+        non_null_used_blocks=0,
+        resident_key_count=0,
+        hashed_physical_block_count=0,
+        tracker_generation=0,
+        tracker_completed_ordinal=0,
+        tracker_metadata_count=0,
+    )
+
+
+def test_populated_local_state_distinguishes_logical_and_physical_residency(
+    manager: KVCacheManager,
+):
+    _populate_prefix_retention_local_state(manager, num_physical_blocks=2)
+
+    assert manager.prefix_retention_local_state() == PrefixRetentionLocalState(
+        non_null_used_blocks=2,
+        resident_key_count=1,
+        hashed_physical_block_count=2,
+        tracker_generation=0,
+        tracker_completed_ordinal=1,
+        tracker_metadata_count=1,
+    )
+
+
+def test_failed_reset_preserves_entire_local_state(manager: KVCacheManager):
+    _populate_prefix_retention_local_state(manager, num_physical_blocks=1)
+    before = manager.prefix_retention_local_state()
+
+    assert not manager.reset_prefix_cache()
+
+    assert manager.prefix_retention_local_state() == before
+
+
+def test_successful_reset_clears_local_state_and_increments_generation_once(
+    manager: KVCacheManager,
+):
+    blocks = _populate_prefix_retention_local_state(manager, num_physical_blocks=2)
+    manager.block_pool.free_blocks(blocks)
+    assert manager.prefix_retention_local_state() == PrefixRetentionLocalState(
+        non_null_used_blocks=0,
+        resident_key_count=1,
+        hashed_physical_block_count=2,
+        tracker_generation=0,
+        tracker_completed_ordinal=1,
+        tracker_metadata_count=1,
+    )
+
+    assert manager.reset_prefix_cache()
+
+    assert manager.prefix_retention_local_state() == PrefixRetentionLocalState(
+        non_null_used_blocks=0,
+        resident_key_count=0,
+        hashed_physical_block_count=0,
+        tracker_generation=1,
+        tracker_completed_ordinal=0,
+        tracker_metadata_count=0,
+    )
+
+
+def test_local_state_capture_never_calls_policy_snapshot(
+    manager: KVCacheManager, monkeypatch
+):
+    monkeypatch.setattr(
+        manager.prefix_retention_tracker,
+        "snapshot",
+        Mock(side_effect=AssertionError("state capture must not snapshot policy")),
+    )
+
+    state = manager.prefix_retention_local_state()
+
+    assert state.tracker_completed_ordinal == 0
+
+
 def test_reset_prefix_cache():
     block_size = 16
     manager = make_kv_cache_manager(
@@ -2416,9 +2523,7 @@ def test_tracker_closure_is_preferred_and_insufficient_history_falls_back_to_arc
     assert no_recurrence.register_chain([root])
     for _ in range(3):
         assert no_recurrence.record_completed_access([root])
-    fallback_protection = no_recurrence.protected_hashes(
-        no_recurrence.snapshot([root])
-    )
+    fallback_protection = no_recurrence.protected_hashes(no_recurrence.snapshot([root]))
     assert fallback_protection == {root}
 
     no_recurrence_pool = BlockPool(
