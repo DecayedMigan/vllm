@@ -44,6 +44,7 @@ from vllm.v1.core.prefix_retention_observer import (
     PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION,
     PrefixRetentionReceiptBatch,
     PrefixRetentionResetReceipt,
+    PrefixRetentionRuntimeConfigReceipt,
 )
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
@@ -362,6 +363,7 @@ class Scheduler(SchedulerInterface):
                 self.cache_config.prefix_retention_observer_capacity
             ),
         )
+        self._record_prefix_retention_runtime_config(kv_cache_config)
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
@@ -405,6 +407,38 @@ class Scheduler(SchedulerInterface):
             self._re_block_ids: dict[str, list[int]] = {}
 
         self._pause_state: PauseState = PauseState.UNPAUSED
+
+    def _record_prefix_retention_runtime_config(
+        self, kv_cache_config: KVCacheConfig
+    ) -> None:
+        if not self.cache_config.enable_prefix_retention_observer:
+            return
+
+        tracker = self.prefix_retention_tracker
+        manager = self.kv_cache_manager
+        pool = manager.block_pool
+        assert tracker is manager.prefix_retention_tracker
+        assert tracker is pool.prefix_retention_tracker
+        pool.record_prefix_retention_runtime_config(
+            PrefixRetentionRuntimeConfigReceipt(
+                schema_version=PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION,
+                policy=tracker.policy.value,
+                budget_blocks=tracker.budget_blocks,
+                prefix_caching_enabled=manager.enable_caching,
+                scheduler_block_size=self.block_size,
+                hash_block_size=pool.hash_block_size,
+                num_gpu_blocks=pool.num_gpu_blocks,
+                num_kv_groups=len(kv_cache_config.kv_cache_groups),
+                capability_mode=(
+                    "lru_bypass"
+                    if tracker.policy is PrefixRetentionPolicy.LRU
+                    else "non_lru_envelope_passed"
+                ),
+                tracker_binding_verified=True,
+                observer_enabled=self.cache_config.enable_prefix_retention_observer,
+                observer_capacity=self.cache_config.prefix_retention_observer_capacity,
+            )
+        )
 
     def _mamba_block_aligned_split(
         self,

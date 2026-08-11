@@ -39,6 +39,7 @@ from vllm.v1.core.prefix_retention_observer import (
     PrefixRetentionReceiptBatch,
     PrefixRetentionReceiptBuffer,
     PrefixRetentionResetReceipt,
+    PrefixRetentionRuntimeConfigReceipt,
     PrefixRetentionTrackerMetadataPreimage,
     disabled_prefix_retention_receipt_batch,
 )
@@ -234,6 +235,13 @@ class BlockPool:
         self, receipt: PrefixRetentionResetReceipt
     ) -> None:
         """Append a reset outcome when observation is enabled."""
+        buffer = self._prefix_retention_receipt_buffer
+        if buffer is not None:
+            buffer.append(receipt)
+
+    def record_prefix_retention_runtime_config(
+        self, receipt: PrefixRetentionRuntimeConfigReceipt
+    ) -> None:
         buffer = self._prefix_retention_receipt_buffer
         if buffer is not None:
             buffer.append(receipt)

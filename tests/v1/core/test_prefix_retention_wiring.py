@@ -11,7 +11,11 @@ import vllm.v1.core.sched.scheduler as scheduler_module
 from vllm.config import CacheConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.prefix_retention import PrefixRetentionPolicy
+from vllm.v1.core.prefix_retention_observer import (
+    PrefixRetentionRuntimeConfigReceipt,
+)
 from vllm.v1.core.sched.scheduler import (
     Scheduler,
     _create_prefix_retention_tracker,
@@ -195,6 +199,92 @@ def _make_real_scheduler_inputs(
     return vllm_config, kv_cache_config
 
 
+def _make_real_scheduler(monkeypatch, **input_kwargs) -> Scheduler:
+    vllm_config, kv_cache_config = _make_real_scheduler_inputs(**input_kwargs)
+    monkeypatch.setattr(
+        scheduler_module.EventPublisherFactory,
+        "create",
+        Mock(return_value=Mock()),
+    )
+    mm_registry = Mock()
+    mm_registry.supports_multimodal_inputs.return_value = False
+    return Scheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        structured_output_manager=Mock(),
+        block_size=4,
+        hash_block_size=4,
+        mm_registry=mm_registry,
+    )
+
+
+@pytest.mark.parametrize(
+    ("policy", "budget", "capability_mode"),
+    [
+        ("lru", 0, "lru_bypass"),
+        ("prefix_recency", 2, "non_lru_envelope_passed"),
+        ("arc", 2, "non_lru_envelope_passed"),
+        ("recurplan", 2, "non_lru_envelope_passed"),
+    ],
+)
+def test_runtime_config_receipt_is_first_and_uses_effective_objects(
+    monkeypatch, policy: str, budget: int, capability_mode: str
+):
+    scheduler = _make_real_scheduler(
+        monkeypatch,
+        policy=policy,
+        budget=budget,
+        enable_observer=True,
+        observer_capacity=19,
+    )
+
+    batch = scheduler.take_prefix_retention_receipts()
+
+    assert len(batch.receipts) == 1
+    receipt = batch.receipts[0]
+    assert isinstance(receipt, PrefixRetentionRuntimeConfigReceipt)
+    assert receipt.policy == scheduler.prefix_retention_tracker.policy.value
+    assert receipt.budget_blocks == scheduler.prefix_retention_tracker.budget_blocks
+    assert (
+        receipt.hash_block_size
+        == scheduler.kv_cache_manager.block_pool.hash_block_size
+        == 4
+    )
+    assert (
+        receipt.num_gpu_blocks
+        == scheduler.kv_cache_manager.block_pool.num_gpu_blocks
+        == 8
+    )
+    assert receipt.prefix_caching_enabled is True
+    assert receipt.scheduler_block_size == 4
+    assert receipt.num_kv_groups == 1
+    assert receipt.capability_mode == capability_mode
+    assert receipt.tracker_binding_verified is True
+    assert receipt.observer_enabled is True
+    assert receipt.observer_capacity == batch.capacity == 19
+
+
+def test_disabled_runtime_config_receipt_returns_before_construction(monkeypatch):
+    monkeypatch.setattr(
+        scheduler_module,
+        "PrefixRetentionRuntimeConfigReceipt",
+        Mock(side_effect=AssertionError("disabled observer must not build receipt")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        BlockPool,
+        "record_prefix_retention_runtime_config",
+        Mock(side_effect=AssertionError("disabled observer must not append receipt")),
+        raising=False,
+    )
+
+    scheduler = _make_real_scheduler(monkeypatch, enable_observer=False)
+
+    batch = scheduler.take_prefix_retention_receipts()
+    assert batch.observer_enabled is False
+    assert batch.receipts == ()
+
+
 @pytest.mark.parametrize(
     ("policy", "budget"),
     [
@@ -341,7 +431,7 @@ def test_cache_config_rejects_invalid_observer_capacity(capacity):
         )
 
 
-def test_real_scheduler_invalid_gate_precedes_all_side_effect_factories(monkeypatch):
+def test_invalid_capability_emits_no_runtime_receipt_before_side_effects(monkeypatch):
     vllm_config, kv_cache_config = _make_real_scheduler_inputs(
         enable_prefix_caching=False
     )
@@ -350,6 +440,7 @@ def test_real_scheduler_invalid_gate_precedes_all_side_effect_factories(monkeypa
     event_factory = Mock()
     ec_factory = Mock()
     manager_factory = Mock()
+    receipt_factory = Mock()
     monkeypatch.setattr(scheduler_module, "PrefixRetentionTracker", tracker_factory)
     monkeypatch.setattr(
         scheduler_module.KVConnectorFactory,
@@ -367,6 +458,12 @@ def test_real_scheduler_invalid_gate_precedes_all_side_effect_factories(monkeypa
         ec_factory,
     )
     monkeypatch.setattr(scheduler_module, "KVCacheManager", manager_factory)
+    monkeypatch.setattr(
+        scheduler_module,
+        "PrefixRetentionRuntimeConfigReceipt",
+        receipt_factory,
+        raising=False,
+    )
 
     with pytest.raises(ValueError, match="prefix_caching_disabled"):
         Scheduler(
@@ -383,6 +480,7 @@ def test_real_scheduler_invalid_gate_precedes_all_side_effect_factories(monkeypa
     event_factory.assert_not_called()
     ec_factory.assert_not_called()
     manager_factory.assert_not_called()
+    receipt_factory.assert_not_called()
 
 
 @pytest.mark.parametrize(
