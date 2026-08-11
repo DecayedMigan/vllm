@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import replace
+
 import pytest
 
 from vllm.v1.core.kv_cache_utils import (
@@ -114,6 +116,29 @@ def test_prefix_recency_prefers_the_latest_completed_access():
     assert tracker.record_completed_access([newer])
 
     assert tracker.protected_hashes(tracker.snapshot([older, newer])) == {newer}
+
+
+def test_prefix_recency_is_closure_aware_last_seen_without_period_features():
+    old_root, old_leaf = _hash(b"old-root"), _hash(b"old-leaf")
+    new_root, new_leaf = _hash(b"new-root"), _hash(b"new-leaf")
+    tracker = _tracker(PrefixRetentionPolicy.PREFIX_RECENCY, budget=2)
+    assert tracker.register_chain([old_root, old_leaf])
+    assert tracker.register_chain([new_root, new_leaf])
+    assert tracker.record_completed_access([old_root, old_leaf])
+    assert tracker.record_completed_access([new_root, new_leaf])
+
+    snapshot = tracker.snapshot([old_root, old_leaf, new_root, new_leaf])
+    expected = frozenset({new_root, new_leaf})
+    assert tracker.protected_hashes(snapshot) == expected
+
+    altered = replace(
+        snapshot,
+        metadata=tuple(
+            replace(item, gaps=(1, 1, 1, 1000)) for item in snapshot.metadata
+        ),
+    )
+    assert tracker.protected_hashes(altered) == expected
+    assert len(expected) == tracker.budget_blocks
 
 
 def test_lfu_prefers_count_before_recency():
