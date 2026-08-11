@@ -14,6 +14,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.prefix_retention import PrefixRetentionPolicy
 from vllm.v1.core.prefix_retention_observer import (
+    PrefixRetentionResetReceipt,
     PrefixRetentionRuntimeConfigReceipt,
 )
 from vllm.v1.core.sched.scheduler import (
@@ -344,20 +345,35 @@ def test_real_scheduler_wires_one_tracker_to_manager_and_pool(monkeypatch):
     assert batch.observer_enabled is True
     assert batch.capacity == 19
 
-    generation_before = tracker.observation_state().generation
+    local_state_before = scheduler.kv_cache_manager.prefix_retention_local_state()
     reset = scheduler.reset_prefix_cache_with_receipt(reset_connector=True)
-    assert reset.local_cache_reset is True
-    assert reset.tracker_history_reset is True
-    assert reset.connector_reset_requested is True
-    assert reset.connector_reset_successful is True
-    assert reset.tracker_generation_before == generation_before
-    assert reset.tracker_generation_after == generation_before + 1
-    assert reset.reset_successful is True
+    local_state_after = scheduler.kv_cache_manager.prefix_retention_local_state()
+    assert isinstance(reset, PrefixRetentionResetReceipt)
+    assert reset.attempt_ordinal == 1
+    assert reset.reset_running_requests_requested is False
+    assert reset.reset_connector_requested is True
+    assert reset.running_requests_before == 0
+    assert reset.preempted_requests == 0
+    assert reset.running_requests_after == 0
+    assert reset.local_reset_attempted is True
+    assert reset.local_reset_succeeded is True
+    assert reset.connector_configured is False
+    assert reset.connector_reset_attempted is False
+    assert reset.connector_reset_succeeded is True
+    assert reset.overall_succeeded is True
+    assert reset.reason_tokens == ()
+    assert reset.local_state_before == local_state_before
+    assert reset.local_state_after == local_state_after
+    assert local_state_after.tracker_generation == (
+        local_state_before.tracker_generation + 1
+    )
+    assert reset.all_blocks_cleared_emitted is False
     buffer = scheduler.kv_cache_manager.block_pool._prefix_retention_receipt_buffer
     assert buffer is not None
     buffer.mark_failed()
     reset_batch = scheduler.take_prefix_retention_receipts()
     assert reset_batch.receipts == (reset,)
+    assert reset_batch.receipts[0] is reset
     assert reset_batch.observation_failed is True
 
 
@@ -378,20 +394,29 @@ def test_reset_receipt_reports_local_failure_without_resetting_tracker(monkeypat
         hash_block_size=4,
         mm_registry=mm_registry,
     )
+    scheduler.take_prefix_retention_receipts()
     scheduler.kv_cache_manager.block_pool.get_new_blocks(1)
-    generation_before = (
-        scheduler.prefix_retention_tracker.observation_state().generation
-    )
+    scheduler.take_prefix_retention_receipts()
+    local_state_before = scheduler.kv_cache_manager.prefix_retention_local_state()
 
     reset = scheduler.reset_prefix_cache_with_receipt()
 
-    assert reset.local_cache_reset is False
-    assert reset.tracker_history_reset is False
-    assert reset.connector_reset_requested is False
-    assert reset.connector_reset_successful is None
-    assert reset.tracker_generation_before == generation_before
-    assert reset.tracker_generation_after == generation_before
-    assert reset.reset_successful is False
+    assert isinstance(reset, PrefixRetentionResetReceipt)
+    assert reset.attempt_ordinal == 1
+    assert reset.local_reset_attempted is True
+    assert reset.local_reset_succeeded is False
+    assert reset.reset_connector_requested is False
+    assert reset.connector_configured is False
+    assert reset.connector_reset_attempted is False
+    assert reset.connector_reset_succeeded is None
+    assert reset.overall_succeeded is False
+    assert reset.reason_tokens == ("local_blocks_in_use",)
+    assert reset.local_state_before == local_state_before
+    assert reset.local_state_after == local_state_before
+    assert reset.all_blocks_cleared_emitted is False
+    reset_batch = scheduler.take_prefix_retention_receipts()
+    assert reset_batch.receipts == (reset,)
+    assert reset_batch.receipts[0] is reset
 
 
 def test_reset_receipt_reports_connector_failure(monkeypatch):
@@ -411,15 +436,33 @@ def test_reset_receipt_reports_connector_failure(monkeypatch):
         hash_block_size=4,
         mm_registry=mm_registry,
     )
+    scheduler.take_prefix_retention_receipts()
     scheduler.connector = Mock()
     scheduler.connector.reset_cache.return_value = False
+    local_state_before = scheduler.kv_cache_manager.prefix_retention_local_state()
 
     reset = scheduler.reset_prefix_cache_with_receipt(reset_connector=True)
 
-    assert reset.local_cache_reset is True
-    assert reset.tracker_history_reset is True
-    assert reset.connector_reset_successful is False
-    assert reset.reset_successful is False
+    local_state_after = scheduler.kv_cache_manager.prefix_retention_local_state()
+    assert isinstance(reset, PrefixRetentionResetReceipt)
+    assert reset.attempt_ordinal == 1
+    assert reset.local_reset_attempted is True
+    assert reset.local_reset_succeeded is True
+    assert reset.reset_connector_requested is True
+    assert reset.connector_configured is True
+    assert reset.connector_reset_attempted is True
+    assert reset.connector_reset_succeeded is False
+    assert reset.overall_succeeded is False
+    assert reset.reason_tokens == ("connector_reset_failed",)
+    assert reset.local_state_before == local_state_before
+    assert reset.local_state_after == local_state_after
+    assert local_state_after.tracker_generation == (
+        local_state_before.tracker_generation + 1
+    )
+    assert reset.all_blocks_cleared_emitted is False
+    reset_batch = scheduler.take_prefix_retention_receipts()
+    assert reset_batch.receipts == (reset,)
+    assert reset_batch.receipts[0] is reset
 
 
 @pytest.mark.parametrize("capacity", [0, -1, True, 1.5])

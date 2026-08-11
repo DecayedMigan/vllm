@@ -14,7 +14,11 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorRole,
 )
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
-from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
+from vllm.distributed.kv_events import (
+    AllBlocksCleared,
+    EventPublisherFactory,
+    KVEventBatch,
+)
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
@@ -282,6 +286,7 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+        self._prefix_reset_attempt_ordinal = 0
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -2083,7 +2088,7 @@ class Scheduler(SchedulerInterface):
     ) -> bool:
         return self.reset_prefix_cache_with_receipt(
             reset_running_requests, reset_connector
-        ).reset_successful
+        ).overall_succeeded
 
     def take_prefix_retention_receipts(self) -> PrefixRetentionReceiptBatch:
         """Drain read-only observer receipts from the authoritative block pool."""
@@ -2099,6 +2104,48 @@ class Scheduler(SchedulerInterface):
         Otherwise, this method will only reset the KV prefix cache when there
         is no running requests taking KV cache.
         """
+        self._prefix_reset_attempt_ordinal += 1
+        attempt_ordinal = self._prefix_reset_attempt_ordinal
+        running_requests_before = len(self.running)
+        preempted_requests = 0
+        local_reset_attempted = False
+        local_reset_succeeded = False
+        connector_configured = self.connector is not None
+        connector_reset_attempted = False
+        connector_reset_succeeded: bool | None = None
+        reason_tokens: list[str] = []
+        local_state_before = None
+        local_state_after = None
+        all_blocks_cleared_emitted = False
+        manager = self.kv_cache_manager
+        pool = manager.block_pool
+
+        def finish_receipt() -> PrefixRetentionResetReceipt:
+            overall_succeeded = local_reset_succeeded and (
+                not reset_connector or connector_reset_succeeded is True
+            )
+            receipt = PrefixRetentionResetReceipt(
+                schema_version=PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION,
+                attempt_ordinal=attempt_ordinal,
+                reset_running_requests_requested=reset_running_requests,
+                reset_connector_requested=reset_connector,
+                running_requests_before=running_requests_before,
+                preempted_requests=preempted_requests,
+                running_requests_after=len(self.running),
+                local_reset_attempted=local_reset_attempted,
+                local_reset_succeeded=local_reset_succeeded,
+                connector_configured=connector_configured,
+                connector_reset_attempted=connector_reset_attempted,
+                connector_reset_succeeded=connector_reset_succeeded,
+                overall_succeeded=overall_succeeded,
+                reason_tokens=tuple(reason_tokens),
+                local_state_before=local_state_before,
+                local_state_after=local_state_after,
+                all_blocks_cleared_emitted=all_blocks_cleared_emitted,
+            )
+            pool.record_prefix_retention_reset(receipt)
+            return receipt
+
         if reset_running_requests:
             # For logging.
             timestamp = time.monotonic()
@@ -2110,6 +2157,7 @@ class Scheduler(SchedulerInterface):
             while self.running:
                 request = self.running.pop()
                 self._preempt_request(request, timestamp)
+                preempted_requests += 1
                 # For async scheduling, any output frames already in flight at
                 # preemption time are now stale and must be discarded when they
                 # return. num_output_placeholders is exactly that count: 0 if
@@ -2125,39 +2173,54 @@ class Scheduler(SchedulerInterface):
             # persistent batch in the model runner.
             self.prev_step_scheduled_req_ids.clear()
 
-        generation_before = self.prefix_retention_tracker.observation_state().generation
-        local_cache_reset = self.kv_cache_manager.reset_prefix_cache()
-        generation_after = self.prefix_retention_tracker.observation_state().generation
-        tracker_history_reset = (
-            local_cache_reset and generation_after == generation_before + 1
-        )
-        if reset_running_requests and not local_cache_reset:
-            raise RuntimeError(
-                "Failed to reset KV cache even when all the running requests are "
-                "preempted and moved to the waiting queue. This is likely due to "
-                "the presence of running requests waiting for remote KV transfer, "
-                "which is not supported yet."
+        local_state_before = manager.prefix_retention_local_state()
+        event_queue_start = len(pool.kv_event_queue)
+        local_reset_attempted = True
+        try:
+            local_reset_succeeded = manager.reset_prefix_cache()
+        except Exception:
+            local_state_after = manager.prefix_retention_local_state()
+            all_blocks_cleared_emitted = any(
+                isinstance(event, AllBlocksCleared)
+                for event in pool.kv_event_queue[event_queue_start:]
             )
+            reason_tokens.append("local_reset_exception")
+            finish_receipt()
+            raise
 
-        connector_reset_successful = (
-            self.reset_connector_cache() if reset_connector else None
+        local_state_after = manager.prefix_retention_local_state()
+        all_blocks_cleared_emitted = any(
+            isinstance(event, AllBlocksCleared)
+            for event in pool.kv_event_queue[event_queue_start:]
         )
-        reset_successful = local_cache_reset and (
-            connector_reset_successful is not False
-        )
-        receipt = PrefixRetentionResetReceipt(
-            schema_version=PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION,
-            reset_running_requests=reset_running_requests,
-            connector_reset_requested=reset_connector,
-            local_cache_reset=local_cache_reset,
-            tracker_history_reset=tracker_history_reset,
-            connector_reset_successful=connector_reset_successful,
-            tracker_generation_before=generation_before,
-            tracker_generation_after=generation_after,
-            reset_successful=reset_successful,
-        )
-        self.kv_cache_manager.block_pool.record_prefix_retention_reset(receipt)
-        return receipt
+        if not local_reset_succeeded:
+            reason_tokens.append("local_blocks_in_use")
+            if reset_running_requests:
+                reason_tokens.append("forced_preemption_local_reset_failed")
+                finish_receipt()
+                raise RuntimeError(
+                    "Failed to reset KV cache even when all the running requests "
+                    "are preempted and moved to the waiting queue. This is likely "
+                    "due to the presence of running requests waiting for remote KV "
+                    "transfer, which is not supported yet."
+                )
+
+        if reset_connector:
+            if not connector_configured:
+                connector_reset_succeeded = True
+            else:
+                connector_reset_attempted = True
+                try:
+                    connector_reset_succeeded = self.reset_connector_cache()
+                except Exception:
+                    connector_reset_succeeded = False
+                    reason_tokens.append("connector_reset_exception")
+                    finish_receipt()
+                    raise
+                if not connector_reset_succeeded:
+                    reason_tokens.append("connector_reset_failed")
+
+        return finish_receipt()
 
     def reset_connector_cache(self) -> bool:
         if self.connector is None:

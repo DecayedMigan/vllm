@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+from types import SimpleNamespace
 from unittest.mock import Mock, call
 
 import pytest
@@ -15,6 +16,7 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
+from vllm.distributed.kv_events import AllBlocksCleared
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalKwargsItem,
@@ -22,6 +24,7 @@ from vllm.multimodal.inputs import (
 )
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import (
     get_request_block_hasher,
@@ -31,6 +34,10 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.core.prefix_retention import (
     PrefixRetentionPolicy,
     PrefixRetentionTracker,
+)
+from vllm.v1.core.prefix_retention_observer import (
+    PrefixRetentionLocalState,
+    PrefixRetentionResetReceipt,
 )
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -47,6 +54,138 @@ from vllm.v1.structured_output import StructuredOutputManager
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+_RESET_STATE_BEFORE = PrefixRetentionLocalState(
+    non_null_used_blocks=0,
+    resident_key_count=2,
+    hashed_physical_block_count=2,
+    tracker_generation=4,
+    tracker_completed_ordinal=7,
+    tracker_metadata_count=2,
+)
+_RESET_STATE_AFTER = PrefixRetentionLocalState(
+    non_null_used_blocks=0,
+    resident_key_count=0,
+    hashed_physical_block_count=0,
+    tracker_generation=5,
+    tracker_completed_ordinal=0,
+    tracker_metadata_count=0,
+)
+
+
+class _PrefixResetManagerStub:
+    def __init__(
+        self,
+        block_pool: BlockPool,
+        local_outcomes: tuple[bool | Exception, ...],
+        local_states: tuple[PrefixRetentionLocalState, ...],
+        emit_all_blocks_cleared: tuple[bool, ...],
+    ) -> None:
+        assert len(local_states) == 2 * len(local_outcomes)
+        assert len(emit_all_blocks_cleared) == len(local_outcomes)
+        self.block_pool = block_pool
+        self._local_outcomes = iter(local_outcomes)
+        self._local_states = iter(local_states)
+        self._emit_all_blocks_cleared = iter(emit_all_blocks_cleared)
+        self.reset_calls = 0
+        self.state_calls = 0
+        self.freed_requests: list[object] = []
+
+    def prefix_retention_local_state(self) -> PrefixRetentionLocalState:
+        self.state_calls += 1
+        return next(self._local_states)
+
+    def reset_prefix_cache(self) -> bool:
+        self.reset_calls += 1
+        outcome = next(self._local_outcomes)
+        emit_event = next(self._emit_all_blocks_cleared)
+        if emit_event:
+            self.block_pool.kv_event_queue.append(AllBlocksCleared())
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    def free(self, request: object) -> None:
+        self.freed_requests.append(request)
+
+
+class _PrefixResetConnectorStub:
+    def __init__(self, outcomes: tuple[bool | Exception, ...]) -> None:
+        self._outcomes = iter(outcomes)
+        self.reset_calls = 0
+
+    def reset_cache(self) -> bool:
+        self.reset_calls += 1
+        outcome = next(self._outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def _make_stub_prefix_reset_scheduler(
+    *,
+    local_outcomes: tuple[bool | Exception, ...] = (True,),
+    local_states: tuple[PrefixRetentionLocalState, ...] = (
+        _RESET_STATE_BEFORE,
+        _RESET_STATE_AFTER,
+    ),
+    emit_all_blocks_cleared: tuple[bool, ...] = (False,),
+    connector_outcomes: tuple[bool | Exception, ...] | None = None,
+) -> tuple[
+    Scheduler,
+    _PrefixResetManagerStub,
+    _PrefixResetConnectorStub | None,
+    list[object],
+]:
+    block_pool = BlockPool(
+        num_gpu_blocks=3,
+        enable_caching=True,
+        hash_block_size=4,
+        enable_prefix_retention_observer=True,
+    )
+    manager = _PrefixResetManagerStub(
+        block_pool,
+        local_outcomes,
+        local_states,
+        emit_all_blocks_cleared,
+    )
+    connector = (
+        _PrefixResetConnectorStub(connector_outcomes)
+        if connector_outcomes is not None
+        else None
+    )
+    waiting_requests: list[object] = []
+    scheduler = object.__new__(Scheduler)
+    scheduler._prefix_reset_attempt_ordinal = 0
+    scheduler.running = []
+    scheduler.waiting = SimpleNamespace(
+        prepend_request=lambda request: waiting_requests.insert(0, request)
+    )
+    scheduler.prev_step_scheduled_req_ids = set()
+    scheduler.kv_cache_manager = manager
+    scheduler.prefix_retention_tracker = SimpleNamespace(
+        observation_state=lambda: SimpleNamespace(generation=0)
+    )
+    scheduler.encoder_cache_manager = SimpleNamespace(free=lambda request: None)
+    scheduler.connector = connector
+    scheduler.log_stats = False
+    scheduler.connector_prefix_cache_stats = None
+    return scheduler, manager, connector, waiting_requests
+
+
+def _make_stub_running_request(
+    request_id: str, num_output_placeholders: int = 0
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        request_id=request_id,
+        status=RequestStatus.RUNNING,
+        spec_token_ids=[],
+        num_preemptions=0,
+        num_computed_tokens=3,
+        num_output_placeholders=num_output_placeholders,
+        async_tokens_to_discard=0,
+    )
 
 
 def test_add_requests():
@@ -845,35 +984,301 @@ def test_preempt_during_execution():
     assert requests[1].output_token_ids[0] == 42
 
 
+@pytest.mark.parametrize(
+    (
+        "local_succeeded",
+        "reset_connector",
+        "connector_outcome",
+        "connector_configured",
+        "connector_attempted",
+        "connector_succeeded",
+        "overall_succeeded",
+        "reason_tokens",
+        "all_blocks_cleared_emitted",
+    ),
+    [
+        pytest.param(
+            True,
+            False,
+            True,
+            True,
+            False,
+            None,
+            True,
+            (),
+            True,
+            id="local-success-connector-not-requested",
+        ),
+        pytest.param(
+            True,
+            True,
+            None,
+            False,
+            False,
+            True,
+            True,
+            (),
+            False,
+            id="local-success-connector-not-configured",
+        ),
+        pytest.param(
+            True,
+            True,
+            False,
+            True,
+            True,
+            False,
+            False,
+            ("connector_reset_failed",),
+            False,
+            id="local-success-connector-false",
+        ),
+        pytest.param(
+            False,
+            True,
+            True,
+            True,
+            True,
+            True,
+            False,
+            ("local_blocks_in_use",),
+            False,
+            id="local-failure-connector-true",
+        ),
+        pytest.param(
+            False,
+            True,
+            False,
+            True,
+            True,
+            False,
+            False,
+            ("local_blocks_in_use", "connector_reset_failed"),
+            False,
+            id="local-failure-connector-false",
+        ),
+    ],
+)
+def test_prefix_reset_receipt_result_matrix(
+    local_succeeded: bool,
+    reset_connector: bool,
+    connector_outcome: bool | None,
+    connector_configured: bool,
+    connector_attempted: bool,
+    connector_succeeded: bool | None,
+    overall_succeeded: bool,
+    reason_tokens: tuple[str, ...],
+    all_blocks_cleared_emitted: bool,
+):
+    state_after = _RESET_STATE_AFTER if local_succeeded else _RESET_STATE_BEFORE
+    scheduler, manager, connector, _ = _make_stub_prefix_reset_scheduler(
+        local_outcomes=(local_succeeded,),
+        local_states=(_RESET_STATE_BEFORE, state_after),
+        emit_all_blocks_cleared=(all_blocks_cleared_emitted,),
+        connector_outcomes=(connector_outcome,)
+        if connector_outcome is not None
+        else None,
+    )
+    # A stale event must not be mistaken for one emitted by this reset.
+    manager.block_pool.kv_event_queue.append(AllBlocksCleared())
+
+    result = scheduler.reset_prefix_cache(reset_connector=reset_connector)
+
+    batch = scheduler.take_prefix_retention_receipts()
+    assert len(batch.receipts) == 1
+    receipt = batch.receipts[0]
+    assert isinstance(receipt, PrefixRetentionResetReceipt)
+    assert result is overall_succeeded
+    assert receipt.attempt_ordinal == 1
+    assert receipt.reset_running_requests_requested is False
+    assert receipt.reset_connector_requested is reset_connector
+    assert receipt.running_requests_before == 0
+    assert receipt.preempted_requests == 0
+    assert receipt.running_requests_after == 0
+    assert receipt.local_reset_attempted is True
+    assert receipt.local_reset_succeeded is local_succeeded
+    assert receipt.connector_configured is connector_configured
+    assert receipt.connector_reset_attempted is connector_attempted
+    assert receipt.connector_reset_succeeded is connector_succeeded
+    assert receipt.overall_succeeded is overall_succeeded
+    assert receipt.reason_tokens == reason_tokens
+    assert receipt.local_state_before == _RESET_STATE_BEFORE
+    assert receipt.local_state_after == state_after
+    assert receipt.all_blocks_cleared_emitted is all_blocks_cleared_emitted
+    assert manager.reset_calls == 1
+    assert manager.state_calls == 2
+    if connector is not None:
+        assert connector.reset_calls == int(connector_attempted)
+
+
+def test_reset_prefix_cache_public_bool_api_uses_v2_receipt_without_network():
+    scheduler, manager, _, _ = _make_stub_prefix_reset_scheduler(
+        local_outcomes=(True, True),
+        local_states=(
+            _RESET_STATE_BEFORE,
+            _RESET_STATE_AFTER,
+            _RESET_STATE_AFTER,
+            _RESET_STATE_AFTER,
+        ),
+        emit_all_blocks_cleared=(False, False),
+    )
+
+    assert scheduler.reset_prefix_cache() is True
+    assert scheduler.reset_prefix_cache() is True
+
+    batch = scheduler.take_prefix_retention_receipts()
+    assert len(batch.receipts) == 2
+    first, second = batch.receipts
+    assert isinstance(first, PrefixRetentionResetReceipt)
+    assert isinstance(second, PrefixRetentionResetReceipt)
+    assert [first.attempt_ordinal, second.attempt_ordinal] == [1, 2]
+    assert manager.reset_calls == 2
+    assert manager.state_calls == 4
+
+
+def test_forced_reset_receipt_is_buffered_before_runtime_error():
+    scheduler, manager, _, waiting_requests = _make_stub_prefix_reset_scheduler(
+        local_outcomes=(False,),
+        local_states=(_RESET_STATE_BEFORE, _RESET_STATE_BEFORE),
+    )
+    first = _make_stub_running_request("first", num_output_placeholders=2)
+    second = _make_stub_running_request("second", num_output_placeholders=1)
+    scheduler.running = [first, second]
+    scheduler.prev_step_scheduled_req_ids = {"first", "second"}
+
+    with pytest.raises(RuntimeError, match="Failed to reset KV cache"):
+        scheduler.reset_prefix_cache(reset_running_requests=True)
+
+    batch = scheduler.take_prefix_retention_receipts()
+    assert len(batch.receipts) == 1
+    receipt = batch.receipts[0]
+    assert isinstance(receipt, PrefixRetentionResetReceipt)
+    assert receipt.attempt_ordinal == 1
+    assert receipt.reset_running_requests_requested is True
+    assert receipt.running_requests_before == 2
+    assert receipt.preempted_requests == 2
+    assert receipt.running_requests_after == 0
+    assert receipt.local_reset_attempted is True
+    assert receipt.local_reset_succeeded is False
+    assert receipt.connector_reset_attempted is False
+    assert receipt.connector_reset_succeeded is None
+    assert receipt.overall_succeeded is False
+    assert receipt.reason_tokens == (
+        "local_blocks_in_use",
+        "forced_preemption_local_reset_failed",
+    )
+    assert receipt.local_state_before == _RESET_STATE_BEFORE
+    assert receipt.local_state_after == _RESET_STATE_BEFORE
+    assert receipt.all_blocks_cleared_emitted is False
+    assert manager.freed_requests == [second, first]
+    assert waiting_requests == [first, second]
+    assert scheduler.prev_step_scheduled_req_ids == set()
+    assert [first.status, second.status] == [
+        RequestStatus.PREEMPTED,
+        RequestStatus.PREEMPTED,
+    ]
+    assert [first.async_tokens_to_discard, second.async_tokens_to_discard] == [2, 1]
+    assert [first.num_output_placeholders, second.num_output_placeholders] == [0, 0]
+
+
+def test_prefix_reset_receipt_records_local_exception_before_reraising():
+    scheduler, _, connector, _ = _make_stub_prefix_reset_scheduler(
+        local_outcomes=(ValueError("local-boom"),),
+        local_states=(_RESET_STATE_BEFORE, _RESET_STATE_BEFORE),
+        connector_outcomes=(True,),
+    )
+
+    with pytest.raises(ValueError, match="local-boom"):
+        scheduler.reset_prefix_cache(reset_connector=True)
+
+    batch = scheduler.take_prefix_retention_receipts()
+    assert len(batch.receipts) == 1
+    receipt = batch.receipts[0]
+    assert isinstance(receipt, PrefixRetentionResetReceipt)
+    assert receipt.local_reset_attempted is True
+    assert receipt.local_reset_succeeded is False
+    assert receipt.connector_configured is True
+    assert receipt.connector_reset_attempted is False
+    assert receipt.connector_reset_succeeded is None
+    assert receipt.overall_succeeded is False
+    assert receipt.reason_tokens == ("local_reset_exception",)
+    assert receipt.local_state_before == _RESET_STATE_BEFORE
+    assert receipt.local_state_after == _RESET_STATE_BEFORE
+    assert receipt.all_blocks_cleared_emitted is False
+    assert connector is not None
+    assert connector.reset_calls == 0
+
+
+def test_prefix_reset_receipt_records_connector_exception_before_reraising():
+    scheduler, _, connector, _ = _make_stub_prefix_reset_scheduler(
+        connector_outcomes=(RuntimeError("connector-boom"),),
+        emit_all_blocks_cleared=(True,),
+    )
+
+    with pytest.raises(RuntimeError, match="connector-boom"):
+        scheduler.reset_prefix_cache(reset_connector=True)
+
+    batch = scheduler.take_prefix_retention_receipts()
+    assert len(batch.receipts) == 1
+    receipt = batch.receipts[0]
+    assert isinstance(receipt, PrefixRetentionResetReceipt)
+    assert receipt.local_reset_attempted is True
+    assert receipt.local_reset_succeeded is True
+    assert receipt.connector_configured is True
+    assert receipt.connector_reset_attempted is True
+    assert receipt.connector_reset_succeeded is False
+    assert receipt.overall_succeeded is False
+    assert receipt.reason_tokens == ("connector_reset_exception",)
+    assert receipt.local_state_before == _RESET_STATE_BEFORE
+    assert receipt.local_state_after == _RESET_STATE_AFTER
+    assert receipt.all_blocks_cleared_emitted is True
+    assert connector is not None
+    assert connector.reset_calls == 1
+
+
 def test_scheduler_reset_prefix_cache():
-    scheduler = create_scheduler(enable_prefix_caching=True)
-    requests = create_requests(num_requests=10)
-    for request in requests:
-        scheduler.add_request(request)
-
-    # Initial scheduling, requests should be at the running state now
-    _ = scheduler.schedule()
-
-    # Verify requests moved from waiting to running
-    assert len(scheduler.waiting) == 0
-    assert len(scheduler.running) == len(requests)
-    for i, request in enumerate(requests):
-        assert scheduler.running[i] == request
+    scheduler, manager, _, waiting_requests = _make_stub_prefix_reset_scheduler(
+        local_outcomes=(False, True),
+        local_states=(
+            _RESET_STATE_BEFORE,
+            _RESET_STATE_BEFORE,
+            _RESET_STATE_BEFORE,
+            _RESET_STATE_AFTER,
+        ),
+        emit_all_blocks_cleared=(False, False),
+    )
+    requests = [_make_stub_running_request(str(i)) for i in range(10)]
+    scheduler.running = list(requests)
+    scheduler.prev_step_scheduled_req_ids = {request.request_id for request in requests}
 
     # Reset prefix cache should fail since there are still running requests
     # and they are taking KV cache
-    assert not scheduler.reset_prefix_cache()
+    assert scheduler.reset_prefix_cache() is False
+    assert scheduler.running == requests
 
     # Reset prefix cache with reset_running_requests=True. All running requests
     # Should be pushed back to the waiting queue and kv cache should be freed
-    assert scheduler.reset_prefix_cache(reset_running_requests=True)
+    assert scheduler.reset_prefix_cache(reset_running_requests=True) is True
 
     # Verify requests moved from running to waiting
-    assert len(scheduler.waiting) == len(requests)
-    assert len(scheduler.running) == 0
+    assert waiting_requests == requests
+    assert scheduler.running == []
+    assert manager.freed_requests == list(reversed(requests))
+    assert all(request.status is RequestStatus.PREEMPTED for request in requests)
+    assert scheduler.prev_step_scheduled_req_ids == set()
 
-    for i, request in enumerate(requests):
-        assert scheduler.waiting[i] == request
+    batch = scheduler.take_prefix_retention_receipts()
+    assert len(batch.receipts) == 2
+    failed, forced = batch.receipts
+    assert isinstance(failed, PrefixRetentionResetReceipt)
+    assert isinstance(forced, PrefixRetentionResetReceipt)
+    assert [failed.attempt_ordinal, forced.attempt_ordinal] == [1, 2]
+    assert failed.reason_tokens == ("local_blocks_in_use",)
+    assert failed.running_requests_before == failed.running_requests_after == 10
+    assert failed.preempted_requests == 0
+    assert forced.reason_tokens == ()
+    assert forced.running_requests_before == forced.preempted_requests == 10
+    assert forced.running_requests_after == 0
 
 
 def test_reset_connector_cache_no_connector_is_no_op_success():
