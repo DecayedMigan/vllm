@@ -38,6 +38,8 @@ from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.core_client import (
     AsyncMPClient,
+    DPAsyncMPClient,
+    DPLBAsyncMPClient,
     EngineCoreClient,
     InprocClient,
     MPClient,
@@ -78,6 +80,14 @@ def test_inproc_drain_forwards_without_serialization():
     engine.engine_core = client
     assert engine.take_prefix_retention_receipts() is expected
 
+    expected_reset = Mock(spec=PrefixRetentionResetReceipt)
+    client.engine_core.reset_prefix_cache_with_receipt.return_value = expected_reset
+    assert client.reset_prefix_cache_with_receipt() is expected_reset
+    client.engine_core.reset_prefix_cache_with_receipt.assert_called_once_with(
+        False, False
+    )
+    assert engine.reset_prefix_cache_with_receipt() is expected_reset
+
 
 @pytest.mark.parametrize(
     "method",
@@ -92,17 +102,55 @@ def test_non_inproc_receipt_drain_is_rejected(method):
         method(Mock())
 
 
-def test_multiprocess_utility_bypasses_are_rejected_before_transport():
+@pytest.mark.parametrize(
+    "method_name",
+    ("take_prefix_retention_receipts", "reset_prefix_cache_with_receipt"),
+)
+def test_multiprocess_utility_bypasses_are_rejected_before_transport(method_name):
+    sync_client = Mock()
+    sync_client._send_input.side_effect = AssertionError("transport reached")
     with pytest.raises(ValueError, match="prefix_retention_receipts_inproc_only"):
-        SyncMPClient.call_utility(Mock(), "take_prefix_retention_receipts")
+        SyncMPClient.call_utility(sync_client, method_name)
+    sync_client._send_input.assert_not_called()
 
     async def invoke_async_bypass() -> None:
+        async_client = Mock()
+        async_client._call_utility_async.side_effect = AssertionError(
+            "transport reached"
+        )
         with pytest.raises(ValueError, match="prefix_retention_receipts_inproc_only"):
-            await AsyncMPClient.call_utility_async(
-                Mock(), "take_prefix_retention_receipts"
-            )
+            await AsyncMPClient.call_utility_async(async_client, method_name)
+        async_client._call_utility_async.assert_not_called()
+
+        dplb_client = Mock()
+        dplb_client.core_engines = (object(),)
+        dplb_client._call_utility_async.side_effect = AssertionError(
+            "transport reached"
+        )
+        with pytest.raises(ValueError, match="prefix_retention_receipts_inproc_only"):
+            await DPLBAsyncMPClient.call_utility_async(dplb_client, method_name)
+        dplb_client._call_utility_async.assert_not_called()
 
     asyncio.run(invoke_async_bypass())
+
+
+@pytest.mark.parametrize(
+    "client_type",
+    (
+        EngineCoreClient,
+        MPClient,
+        AsyncMPClient,
+        DPAsyncMPClient,
+        DPLBAsyncMPClient,
+        SyncMPClient,
+    ),
+)
+def test_non_inproc_reset_receipt_helper_is_rejected_before_transport(client_type):
+    client = Mock()
+    client.call_utility.side_effect = AssertionError("transport reached")
+    with pytest.raises(ValueError, match="prefix_retention_receipts_inproc_only"):
+        client_type.reset_prefix_cache_with_receipt(client)
+    client.call_utility.assert_not_called()
 
 
 def test_runtime_config_receipt_is_immutable():

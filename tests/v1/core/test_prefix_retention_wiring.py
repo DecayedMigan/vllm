@@ -14,6 +14,8 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.prefix_retention import PrefixRetentionPolicy
 from vllm.v1.core.prefix_retention_observer import (
+    PrefixRetentionCompletedAccessReceipt,
+    PrefixRetentionDecisionReceipt,
     PrefixRetentionResetReceipt,
     PrefixRetentionRuntimeConfigReceipt,
 )
@@ -29,6 +31,8 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
 )
+
+from .utils import create_requests
 
 pytestmark = pytest.mark.cpu_test
 
@@ -375,6 +379,45 @@ def test_real_scheduler_wires_one_tracker_to_manager_and_pool(monkeypatch):
     assert reset_batch.receipts == (reset,)
     assert reset_batch.receipts[0] is reset
     assert reset_batch.observation_failed is True
+
+
+def test_real_scheduler_receipt_stream_preserves_causal_request_identity(monkeypatch):
+    scheduler = _make_real_scheduler(
+        monkeypatch,
+        enable_observer=True,
+        observer_capacity=19,
+    )
+    runtime_batch = scheduler.take_prefix_retention_receipts()
+    assert [type(item) for item in runtime_batch.receipts] == [
+        PrefixRetentionRuntimeConfigReceipt
+    ]
+
+    assert scheduler.reset_prefix_cache() is True
+    request = create_requests(
+        1,
+        num_tokens=8,
+        max_tokens=1,
+        block_size=4,
+        req_ids=["formal-request-001"],
+    )[0]
+    manager = scheduler.kv_cache_manager
+    allocated = manager.allocate_slots(request, request.num_tokens)
+    assert allocated is not None
+    assert manager.record_completed_request_access(request) is True
+    manager.free(request)
+
+    batch = scheduler.take_prefix_retention_receipts()
+    assert [type(item) for item in batch.receipts] == [
+        PrefixRetentionResetReceipt,
+        PrefixRetentionDecisionReceipt,
+        PrefixRetentionCompletedAccessReceipt,
+    ]
+    reset, decision, completed = batch.receipts
+    assert reset.attempt_ordinal == 1
+    assert decision.allocation_ordinal == 1
+    assert completed.completed_ordinal == 1
+    assert decision.request_id == request.request_id == "formal-request-001"
+    assert completed.request_id == request.request_id
 
 
 def test_reset_receipt_reports_local_failure_without_resetting_tracker(monkeypatch):

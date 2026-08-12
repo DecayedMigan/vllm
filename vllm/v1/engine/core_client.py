@@ -70,6 +70,18 @@ _R = TypeVar("_R")  # Return type for collective_rpc
 
 EngineIdentity = bytes
 
+_PREFIX_RETENTION_INPROC_ONLY_METHODS = frozenset(
+    {
+        "take_prefix_retention_receipts",
+        "reset_prefix_cache_with_receipt",
+    }
+)
+
+
+def _reject_multiprocess_prefix_retention_method(method: str) -> None:
+    if method in _PREFIX_RETENTION_INPROC_ONLY_METHODS:
+        raise ValueError("prefix_retention_receipts_inproc_only")
+
 
 class EngineCoreClient(ABC):
     """
@@ -163,7 +175,7 @@ class EngineCoreClient(ABC):
     def reset_prefix_cache_with_receipt(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> PrefixRetentionResetReceipt:
-        raise NotImplementedError
+        raise ValueError("prefix_retention_receipts_inproc_only")
 
     def reset_encoder_cache(self) -> None:
         raise NotImplementedError
@@ -880,8 +892,7 @@ class SyncMPClient(MPClient):
         self.add_pending_message(tracker, request)
 
     def call_utility(self, method: str, *args) -> Any:
-        if method == "take_prefix_retention_receipts":
-            raise ValueError("prefix_retention_receipts_inproc_only")
+        _reject_multiprocess_prefix_retention_method(method)
         call_id = uuid.uuid1().int >> 64
         future: Future[Any] = Future()
         self.utility_results[call_id] = future
@@ -917,11 +928,7 @@ class SyncMPClient(MPClient):
     def reset_prefix_cache_with_receipt(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> PrefixRetentionResetReceipt:
-        return self.call_utility(
-            "reset_prefix_cache_with_receipt",
-            reset_running_requests,
-            reset_connector,
-        )
+        raise ValueError("prefix_retention_receipts_inproc_only")
 
     def reset_encoder_cache(self) -> None:
         self.call_utility("reset_encoder_cache")
@@ -1117,13 +1124,13 @@ class AsyncMPClient(MPClient):
         return future
 
     async def call_utility_async(self, method: str, *args) -> Any:
-        if method == "take_prefix_retention_receipts":
-            raise ValueError("prefix_retention_receipts_inproc_only")
+        _reject_multiprocess_prefix_retention_method(method)
         return await self._call_utility_async(method, *args, engine=self.core_engine)
 
     async def _call_utility_async(
         self, method: str, *args, engine: EngineIdentity
     ) -> Any:
+        _reject_multiprocess_prefix_retention_method(method)
         call_id = uuid.uuid1().int >> 64
         future = asyncio.get_running_loop().create_future()
         self.utility_results[call_id] = future
@@ -1462,6 +1469,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
     async def call_utility_async(self, method: str, *args) -> Any:
         # Only the result from the first engine is returned.
+        _reject_multiprocess_prefix_retention_method(method)
         return (
             await asyncio.gather(
                 *[
