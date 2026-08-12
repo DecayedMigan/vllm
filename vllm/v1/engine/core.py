@@ -878,6 +878,7 @@ class EngineCoreProc(EngineCore):
 
     def take_prefix_retention_receipts(self) -> PrefixRetentionReceiptBatch:
         raise ValueError("prefix_retention_receipts_inproc_only")
+
     addresses: EngineZmqAddresses
 
     @instrument(span_name="EngineCoreProc init")
