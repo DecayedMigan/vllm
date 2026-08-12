@@ -221,18 +221,11 @@ def test_arc_ghost_hits_move_the_adaptive_partition_both_directions():
 
 def test_arc_resident_history_never_exceeds_budget_under_repeated_churn():
     tracker = _tracker(PrefixRetentionPolicy.ARC, budget=31)
-    keys = tuple(_hash(("key-%d" % index).encode()) for index in range(64))
+    keys = tuple(_hash(f"key-{index:d}".encode()) for index in range(64))
     for key in keys:
         assert tracker.register_chain([key])
 
-    sequence = (
-        keys[:31]
-        + keys[31:62]
-        + keys[:31]
-        + keys[62:]
-        + keys[31:62]
-        + keys[:31]
-    )
+    sequence = keys[:31] + keys[31:62] + keys[:31] + keys[62:] + keys[31:62] + keys[:31]
     for key in sequence:
         assert tracker.record_completed_access([key])
         state = tracker.arc_state()
