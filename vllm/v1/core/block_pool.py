@@ -688,6 +688,12 @@ class BlockPool:
                             for block_hash in frozen_protected_hashes
                         )
                     )
+                    resident_hashes_hex = tuple(
+                        sorted(
+                            bytes(block_hash).hex()
+                            for block_hash in self.get_resident_cached_hashes()
+                        )
+                    )
                     frozen_victims = tuple(victims)
                     receipt = PrefixRetentionDecisionReceipt(
                         schema_version=PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION,
@@ -700,6 +706,7 @@ class BlockPool:
                         tracker_metadata_preimage=tracker_metadata,
                         arc_preimage=arc_preimage,
                         protected_hashes_hex=protected_hashes_hex,
+                        resident_hashes_hex=resident_hashes_hex,
                         candidates=candidates,
                         selected=selected,
                         victims=frozen_victims,

@@ -103,6 +103,7 @@ class PrefixRetentionDecisionReceipt:
     tracker_metadata_preimage: tuple[PrefixRetentionTrackerMetadataPreimage, ...]
     arc_preimage: PrefixRetentionARCPreimage
     protected_hashes_hex: tuple[str, ...]
+    resident_hashes_hex: tuple[str, ...]
     candidates: tuple[PrefixRetentionBlockPreimage, ...]
     selected: tuple[PrefixRetentionBlockPreimage, ...]
     victims: tuple[PrefixRetentionBlockPreimage, ...]
