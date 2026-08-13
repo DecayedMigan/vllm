@@ -351,7 +351,9 @@ def test_protection_receipt_freezes_candidate_classes_before_selection():
     assert receipt.tracker_generation == 0
     assert receipt.completed_ordinal == 0
     assert receipt.protected_hashes_hex == (bytes(protected).hex(),)
-    assert receipt.resident_hashes_hex == (bytes(protected).hex(),)
+    assert receipt.resident_hashes_hex == tuple(
+        sorted((bytes(protected).hex(), bytes(unprotected).hex()))
+    )
     assert [item.category for item in receipt.candidates] == [
         PrefixRetentionBlockCategory.PROTECTED_CACHED,
         PrefixRetentionBlockCategory.UNPROTECTED_CACHED,

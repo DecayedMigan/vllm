@@ -624,6 +624,7 @@ class BlockPool:
 
         free_blocks_before = self.get_num_free_blocks()
         frozen_protected_hashes: frozenset[BlockHashWithGroupId] = frozenset()
+        resident_hashes_hex: tuple[str, ...] = ()
         candidates: tuple[PrefixRetentionBlockPreimage, ...] | None = None
         tracker_metadata: tuple[PrefixRetentionTrackerMetadataPreimage, ...] = ()
         arc_preimage = PrefixRetentionARCPreimage(0, (), (), (), ())
@@ -633,6 +634,12 @@ class BlockPool:
         completed_ordinal = 0
         try:
             frozen_protected_hashes = frozenset(protected_hashes or ())
+            resident_hashes_hex = tuple(
+                sorted(
+                    bytes(block_hash).hex()
+                    for block_hash in self.get_resident_cached_hashes()
+                )
+            )
             (
                 candidates,
                 tracker_metadata,
@@ -686,12 +693,6 @@ class BlockPool:
                         sorted(
                             bytes(block_hash).hex()
                             for block_hash in frozen_protected_hashes
-                        )
-                    )
-                    resident_hashes_hex = tuple(
-                        sorted(
-                            bytes(block_hash).hex()
-                            for block_hash in self.get_resident_cached_hashes()
                         )
                     )
                     frozen_victims = tuple(victims)
