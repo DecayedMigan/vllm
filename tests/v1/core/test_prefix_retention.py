@@ -295,6 +295,33 @@ def test_recurplan_uses_frozen_ordinal_gap_score():
     assert tracker.protected_hashes(tracker.snapshot([periodic, early])) == {periodic}
 
 
+def test_recurplan_scores_each_terminal_once_per_decision(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    recurring = _hash(b"recurring")
+    fillers = [_hash(f"filler-{index}".encode()) for index in range(20)]
+    tracker = _tracker(PrefixRetentionPolicy.RECURPLAN, budget=8)
+    for key in (recurring, *fillers):
+        assert tracker.register_chain([key])
+    for ordinal in range(1, 14):
+        key = recurring if ordinal in {1, 5, 9, 13} else fillers[ordinal - 1]
+        assert tracker.record_completed_access([key])
+
+    calls = 0
+    original = tracker._timing_score
+
+    def counted(metadata, completed_ordinal):
+        nonlocal calls
+        calls += 1
+        return original(metadata, completed_ordinal)
+
+    monkeypatch.setattr(tracker, "_timing_score", counted)
+    snapshot = tracker.snapshot([recurring, *fillers])
+    tracker.protected_hashes(snapshot)
+
+    assert calls == len(snapshot.resident_hashes)
+
+
 def test_recurplan_protects_a_reliable_recurrence_before_it_is_due():
     recurring, filler = _hash(b"a"), _hash(b"z")
     tracker = _tracker(PrefixRetentionPolicy.RECURPLAN, budget=1)

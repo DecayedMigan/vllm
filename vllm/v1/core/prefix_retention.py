@@ -24,6 +24,26 @@ class PrefixRetentionPolicy(str, Enum):
 
 
 @dataclass(frozen=True)
+class _DescendingRatio:
+    numerator: int
+    denominator: int
+
+    def __lt__(self, other: object) -> bool:
+        if not isinstance(other, _DescendingRatio):
+            return NotImplemented
+        return self.numerator * other.denominator > (
+            other.numerator * self.denominator
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, _DescendingRatio):
+            return NotImplemented
+        return self.numerator * other.denominator == (
+            other.numerator * self.denominator
+        )
+
+
+@dataclass(frozen=True)
 class _PrefixMetadata:
     block_hash: BlockHashWithGroupId
     parent: BlockHashWithGroupId | None
@@ -321,6 +341,15 @@ class PrefixRetentionTracker:
             if closure is not None:
                 closures[terminal] = closure
 
+        if self.policy is PrefixRetentionPolicy.RECURPLAN:
+            return self._recurplan_protected_hashes(
+                snapshot, metadata, closures
+            )
+
+        timing_scores = None
+        ranking_cache: dict[
+            tuple[BlockHashWithGroupId, int], tuple[object, ...] | None
+        ] = {}
         protected: set[BlockHashWithGroupId] = set()
         considered: set[BlockHashWithGroupId] = set()
         while len(protected) < self.budget_blocks:
@@ -342,13 +371,21 @@ class PrefixRetentionTracker:
                     continue
                 if cost > remaining:
                     continue
-                ranking = self._ranking(
-                    terminal,
-                    metadata[terminal],
-                    cost,
-                    len(closure),
-                    snapshot,
-                )
+                cache_key = (terminal, cost)
+                if cache_key not in ranking_cache:
+                    ranking_cache[cache_key] = self._ranking(
+                        terminal,
+                        metadata[terminal],
+                        cost,
+                        len(closure),
+                        snapshot,
+                        timing_score=(
+                            timing_scores[terminal]
+                            if timing_scores is not None
+                            else None
+                        ),
+                    )
+                ranking = ranking_cache[cache_key]
                 if ranking is not None:
                     ranked.append((ranking, terminal, marginal))
 
@@ -359,6 +396,116 @@ class PrefixRetentionTracker:
             protected.update(marginal)
 
         return frozenset(protected)
+
+
+    def _recurplan_protected_hashes(
+        self,
+        snapshot: PrefixRetentionSnapshot,
+        metadata: dict[BlockHashWithGroupId, _PrefixMetadata],
+        closures: dict[
+            BlockHashWithGroupId, frozenset[BlockHashWithGroupId]
+        ],
+    ) -> frozenset[BlockHashWithGroupId]:
+        keys = snapshot.resident_hashes
+        bit_for = {key: 1 << index for index, key in enumerate(keys)}
+        closure_masks = {
+            terminal: sum(bit_for[key] for key in closure)
+            for terminal, closure in closures.items()
+        }
+        timing_scores = {
+            terminal: self._timing_score(
+                metadata[terminal], snapshot.completed_ordinal
+            )
+            for terminal in closures
+        }
+        canonical = {
+            terminal: _canonical_key(terminal) for terminal in closures
+        }
+        t1_recency = {
+            key: index for index, key in enumerate(reversed(self._arc_t1))
+        }
+        t2_recency = {
+            key: index for index, key in enumerate(reversed(self._arc_t2))
+        }
+        t1_target = self._arc_target_t1
+        t2_target = max(self.budget_blocks - t1_target, 0)
+
+        protected_mask = 0
+        protected_count = 0
+        considered: set[BlockHashWithGroupId] = set()
+        while protected_count < self.budget_blocks:
+            remaining = self.budget_blocks - protected_count
+            best_terminal: BlockHashWithGroupId | None = None
+            best_marginal = 0
+            best_kind = 2
+            best_numerator = 0
+            best_denominator = 1
+            best_tail: tuple[object, ...] = ()
+
+            for terminal, closure_mask in closure_masks.items():
+                if terminal in considered:
+                    continue
+                marginal = closure_mask & ~protected_mask
+                cost = marginal.bit_count()
+                if cost == 0:
+                    considered.add(terminal)
+                    continue
+                if cost > remaining:
+                    continue
+
+                score = timing_scores[terminal]
+                terminal_canonical = canonical[terminal]
+                if score is not None:
+                    numerator = (
+                        score.numerator
+                        * len(closures[terminal])
+                        * snapshot.hash_block_size
+                    )
+                    denominator = score.denominator * cost
+                    tail = (cost, *terminal_canonical)
+                    better = best_terminal is None or best_kind != 0
+                    if best_terminal is not None and best_kind == 0:
+                        cross = numerator * best_denominator
+                        best_cross = best_numerator * denominator
+                        better = cross > best_cross or (
+                            cross == best_cross and tail < best_tail
+                        )
+                    if better:
+                        best_terminal = terminal
+                        best_marginal = marginal
+                        best_kind = 0
+                        best_numerator = numerator
+                        best_denominator = denominator
+                        best_tail = tail
+                    continue
+
+                if terminal in t2_recency:
+                    recency = t2_recency[terminal]
+                    tier = 0 if recency < t2_target else 2
+                elif terminal in t1_recency:
+                    recency = t1_recency[terminal]
+                    tier = 0 if recency < t1_target else 1
+                else:
+                    continue
+                tail = (tier, recency, cost, *terminal_canonical)
+                if (
+                    best_terminal is None
+                    or (best_kind == 1 and tail < best_tail)
+                ):
+                    best_terminal = terminal
+                    best_marginal = marginal
+                    best_kind = 1
+                    best_tail = tail
+
+            if best_terminal is None:
+                break
+            considered.add(best_terminal)
+            protected_mask |= best_marginal
+            protected_count = protected_mask.bit_count()
+
+        return frozenset(
+            key for key, bit in bit_for.items() if protected_mask & bit
+        )
 
     @staticmethod
     def _resident_closure(
@@ -385,6 +532,8 @@ class PrefixRetentionTracker:
         marginal_cost: int,
         terminal_depth: int,
         snapshot: PrefixRetentionSnapshot,
+        *,
+        timing_score: Fraction | None = None,
     ) -> tuple[object, ...] | None:
         canonical = _canonical_key(terminal)
         if self.policy is PrefixRetentionPolicy.PREFIX_RECENCY:
@@ -400,12 +549,18 @@ class PrefixRetentionTracker:
         if self.policy is PrefixRetentionPolicy.ARC:
             return self._arc_ranking(terminal, marginal_cost)
 
-        timing_score = self._timing_score(metadata, snapshot.completed_ordinal)
         if timing_score is None:
             arc_ranking = self._arc_ranking(terminal, marginal_cost)
             return None if arc_ranking is None else (1, *arc_ranking)
-        value = timing_score * terminal_depth * snapshot.hash_block_size / marginal_cost
-        return (0, -value, marginal_cost, *canonical)
+        descending_value = _DescendingRatio(
+            numerator=(
+                timing_score.numerator
+                * terminal_depth
+                * snapshot.hash_block_size
+            ),
+            denominator=timing_score.denominator * marginal_cost,
+        )
+        return (0, descending_value, marginal_cost, *canonical)
 
     def _arc_ranking(
         self, terminal: BlockHashWithGroupId, marginal_cost: int
