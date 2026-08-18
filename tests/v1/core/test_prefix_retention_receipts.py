@@ -363,6 +363,57 @@ def test_protection_receipt_freezes_candidate_classes_before_selection():
     assert [item.block_id for item in receipt.victims] == [2]
 
 
+def test_duplicate_physical_copies_keep_one_deterministic_representative():
+    tracker = PrefixRetentionTracker(
+        policy=PrefixRetentionPolicy.PREFIX_RECENCY,
+        budget_blocks=1,
+        hash_block_size=4,
+    )
+    pool = BlockPool(
+        num_gpu_blocks=6,
+        enable_caching=True,
+        hash_block_size=4,
+        enable_prefix_retention_observer=True,
+        prefix_retention_tracker=tracker,
+    )
+    protected = _key(b"protected", 7)
+    other = _key(b"other", 8)
+    assert tracker.register_chain([protected])
+    assert tracker.register_chain([other])
+    assert tracker.record_completed_access([protected])
+    _cache(pool, 1, protected)
+    pool.blocks[2].block_hash = protected
+    _cache(pool, 3, other)
+
+    protected_hashes = tracker.protected_hashes(
+        tracker.snapshot(pool.get_resident_cached_hashes())
+    )
+    assert protected_hashes == {protected}
+    assert pool._physical_protected_block_ids(protected_hashes) == {2}
+
+    selected = pool.get_new_blocks(
+        3,
+        protected_hashes=protected_hashes,
+        request_id="duplicate-physical",
+    )
+    (receipt,) = _receipts(pool)
+
+    assert [block.block_id for block in selected] == [4, 5, 1]
+    assert [item.block_id for item in receipt.victims] == [1]
+    assert [
+        item.category for item in receipt.candidates
+    ] == [
+        PrefixRetentionBlockCategory.UNPROTECTED_CACHED,
+        PrefixRetentionBlockCategory.PROTECTED_CACHED,
+        PrefixRetentionBlockCategory.UNPROTECTED_CACHED,
+        PrefixRetentionBlockCategory.UNHASHED,
+        PrefixRetentionBlockCategory.UNHASHED,
+    ]
+    assert [
+        block.block_id for block in pool.free_block_queue.get_all_free_blocks()
+    ] == [2, 3]
+
+
 def test_arc_receipt_freezes_complete_adaptive_state():
     tracker = PrefixRetentionTracker(
         policy=PrefixRetentionPolicy.ARC,

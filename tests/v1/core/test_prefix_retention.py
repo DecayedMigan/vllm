@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import replace
+from fractions import Fraction
 
 import pytest
 
@@ -13,6 +14,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.core.prefix_retention import (
     PrefixRetentionPolicy,
     PrefixRetentionTracker,
+    _canonical_key,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -31,6 +33,229 @@ def _tracker(
         budget_blocks=budget,
         hash_block_size=4,
     )
+
+
+def _legacy_protected_hashes(
+    tracker: PrefixRetentionTracker,
+    snapshot,
+) -> frozenset[BlockHashWithGroupId]:
+    """Minimal test-only oracle for the pre-shared set selection loop."""
+    if (
+        snapshot._generation != tracker._generation
+        or tracker.policy is PrefixRetentionPolicy.LRU
+        or tracker.budget_blocks == 0
+    ):
+        return frozenset()
+
+    metadata = {item.block_hash: item for item in snapshot.metadata}
+    resident = frozenset(snapshot.resident_hashes)
+    closures = {
+        terminal: closure
+        for terminal in snapshot.resident_hashes
+        if (
+            closure := tracker._resident_closure(terminal, metadata, resident)
+        )
+        is not None
+    }
+    if tracker.policy is PrefixRetentionPolicy.RECURPLAN:
+        return _legacy_recurplan_protected_hashes(
+            tracker, snapshot, metadata, closures
+        )
+    ranking_cache: dict[
+        tuple[BlockHashWithGroupId, int], tuple[object, ...] | None
+    ] = {}
+    protected: set[BlockHashWithGroupId] = set()
+    considered: set[BlockHashWithGroupId] = set()
+    while len(protected) < tracker.budget_blocks:
+        remaining = tracker.budget_blocks - len(protected)
+        ranked = []
+        for terminal, closure in closures.items():
+            if terminal in considered:
+                continue
+            marginal = closure.difference(protected)
+            cost = len(marginal)
+            if cost == 0:
+                considered.add(terminal)
+                continue
+            if cost > remaining:
+                continue
+            cache_key = (terminal, cost)
+            if cache_key not in ranking_cache:
+                ranking_cache[cache_key] = tracker._ranking(
+                    terminal,
+                    metadata[terminal],
+                    cost,
+                    len(closure),
+                    snapshot,
+                )
+            ranking = ranking_cache[cache_key]
+            if ranking is not None:
+                ranked.append((ranking, terminal, marginal))
+
+        if not ranked:
+            break
+        _, terminal, marginal = min(ranked, key=lambda item: item[0])
+        considered.add(terminal)
+        protected.update(marginal)
+
+    return frozenset(protected)
+
+
+def _legacy_recurplan_protected_hashes(
+    tracker: PrefixRetentionTracker,
+    snapshot,
+    metadata,
+    closures,
+) -> frozenset[BlockHashWithGroupId]:
+    """Test-only reference for the frozen RecurPlan bitmask selector."""
+    bit_for = {
+        key: 1 << index for index, key in enumerate(snapshot.resident_hashes)
+    }
+    closure_masks = {
+        terminal: sum(bit_for[key] for key in closure)
+        for terminal, closure in closures.items()
+    }
+    timing_scores = {
+        terminal: _legacy_timing_score(
+            metadata[terminal], snapshot.completed_ordinal
+        )
+        for terminal in closures
+    }
+    canonical = {terminal: _canonical_key(terminal) for terminal in closures}
+    t1_recency = {
+        key: index for index, key in enumerate(reversed(tracker._arc_t1))
+    }
+    t2_recency = {
+        key: index for index, key in enumerate(reversed(tracker._arc_t2))
+    }
+    t1_target = tracker._arc_target_t1
+    t2_target = max(tracker.budget_blocks - t1_target, 0)
+
+    protected_mask = 0
+    protected_count = 0
+    considered: set[BlockHashWithGroupId] = set()
+    while protected_count < tracker.budget_blocks:
+        remaining = tracker.budget_blocks - protected_count
+        best_terminal: BlockHashWithGroupId | None = None
+        best_marginal = 0
+        best_kind = 2
+        best_numerator = 0
+        best_denominator = 1
+        best_tail: tuple[object, ...] = ()
+
+        for terminal, closure_mask in closure_masks.items():
+            if terminal in considered:
+                continue
+            marginal = closure_mask & ~protected_mask
+            cost = marginal.bit_count()
+            if cost == 0:
+                considered.add(terminal)
+                continue
+            if cost > remaining:
+                continue
+
+            score = timing_scores[terminal]
+            terminal_canonical = canonical[terminal]
+            if score is not None:
+                numerator = (
+                    score.numerator
+                    * len(closures[terminal])
+                    * snapshot.hash_block_size
+                )
+                denominator = score.denominator * cost
+                tail = (cost, *terminal_canonical)
+                better = best_terminal is None or best_kind != 0
+                if best_terminal is not None and best_kind == 0:
+                    cross = numerator * best_denominator
+                    best_cross = best_numerator * denominator
+                    better = cross > best_cross or (
+                        cross == best_cross and tail < best_tail
+                    )
+                if better:
+                    best_terminal = terminal
+                    best_marginal = marginal
+                    best_kind = 0
+                    best_numerator = numerator
+                    best_denominator = denominator
+                    best_tail = tail
+                continue
+
+            if terminal in t2_recency:
+                recency = t2_recency[terminal]
+                tier = 0 if recency < t2_target else 2
+            elif terminal in t1_recency:
+                recency = t1_recency[terminal]
+                tier = 0 if recency < t1_target else 1
+            else:
+                continue
+            tail = (tier, recency, cost, *terminal_canonical)
+            if best_terminal is None or (best_kind == 1 and tail < best_tail):
+                best_terminal = terminal
+                best_marginal = marginal
+                best_kind = 1
+                best_tail = tail
+
+        if best_terminal is None:
+            break
+        considered.add(best_terminal)
+        protected_mask |= best_marginal
+        protected_count = protected_mask.bit_count()
+
+    return frozenset(
+        key for key, bit in bit_for.items() if protected_mask & bit
+    )
+
+
+def _legacy_timing_score(metadata, completed_ordinal: int) -> Fraction | None:
+    """Reference the frozen Fraction-based RecurPlan timing arithmetic."""
+    if len(metadata.gaps) < 3:
+        return None
+    gaps = sorted(metadata.gaps)
+    middle = len(gaps) // 2
+    if len(gaps) % 2:
+        median = Fraction(gaps[middle])
+    else:
+        median = Fraction(gaps[middle - 1] + gaps[middle], 2)
+    dispersion = max(abs(Fraction(gap) - median) for gap in gaps)
+    if dispersion > max(Fraction(1), median):
+        return None
+    age = completed_ordinal - metadata.last_access_ordinal
+    uncertainty_radius = max(Fraction(1), dispersion)
+    if age > median + uncertainty_radius:
+        return None
+    score = Fraction(1) - abs(Fraction(age) - median) / max(
+        median, Fraction(1)
+    )
+    return score if score > 0 else None
+
+
+@pytest.mark.parametrize(
+    ("gaps", "last_access_ordinal", "completed_ordinal"),
+    (
+        ((1, 1, 1), 3, 4),
+        ((1, 2, 3, 4), 20, 22),
+        ((1, 1, 7), 7, 8),
+        ((2, 2, 2, 2), 8, 12),
+        ((2, 2, 2), 4, 9),
+    ),
+)
+def test_recurplan_timing_score_matches_fraction_reference(
+    gaps: tuple[int, ...],
+    last_access_ordinal: int,
+    completed_ordinal: int,
+):
+    key = _hash(b"timing")
+    tracker = _tracker(PrefixRetentionPolicy.RECURPLAN, budget=1)
+    assert tracker.register_chain([key])
+    metadata = replace(
+        tracker.snapshot([key]).metadata[0],
+        gaps=gaps,
+        last_access_ordinal=last_access_ordinal,
+    )
+
+    assert tracker._timing_score(
+        metadata, completed_ordinal
+    ) == _legacy_timing_score(metadata, completed_ordinal)
 
 
 def test_register_chain_builds_ancestor_closure_and_rejects_conflicts_atomically():
@@ -92,6 +317,232 @@ def test_lru_always_returns_empty_even_with_budget_and_history():
     assert tracker.record_completed_access([key])
 
     assert tracker.protected_hashes(tracker.snapshot([key])) == frozenset()
+
+
+def test_lru_bypasses_the_shared_selector_even_with_a_positive_budget(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    key = _hash(b"lru")
+    tracker = _tracker(PrefixRetentionPolicy.LRU, budget=1)
+    assert tracker.register_chain([key])
+    assert tracker.record_completed_access([key])
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("lru must bypass the shared selector")
+
+    monkeypatch.setattr(
+        tracker, "_select_protected_masks", fail_if_called
+    )
+    assert tracker.protected_hashes(tracker.snapshot([key])) == frozenset()
+
+
+@pytest.mark.parametrize(
+    "policy",
+    (
+        PrefixRetentionPolicy.PREFIX_RECENCY,
+        PrefixRetentionPolicy.LFU,
+        PrefixRetentionPolicy.ARC,
+        PrefixRetentionPolicy.RECURPLAN,
+    ),
+)
+def test_non_lru_policies_call_the_shared_bitmask_selector(
+    monkeypatch: pytest.MonkeyPatch,
+    policy: PrefixRetentionPolicy,
+):
+    """A policy bypassing the shared selector would reintroduce an unfair path."""
+    key = _hash(b"shared-selector")
+    tracker = _tracker(policy, budget=1)
+    assert tracker.register_chain([key])
+    assert tracker.record_completed_access([key])
+
+    calls: list[PrefixRetentionPolicy] = []
+    original = tracker._select_protected_masks
+
+    def counted(*args, **kwargs):
+        calls.append(policy)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(tracker, "_select_protected_masks", counted)
+
+    assert tracker.protected_hashes(tracker.snapshot([key])) == {key}
+    assert calls == [policy]
+
+
+@pytest.mark.parametrize(
+    "policy",
+    (
+        PrefixRetentionPolicy.PREFIX_RECENCY,
+        PrefixRetentionPolicy.LFU,
+        PrefixRetentionPolicy.ARC,
+        PrefixRetentionPolicy.RECURPLAN,
+    ),
+)
+@pytest.mark.parametrize("budget", (0, 1, 2, 3, 4, 5))
+def test_shared_selector_matches_legacy_set_oracle_for_shared_ancestors(
+    policy: PrefixRetentionPolicy,
+    budget: int,
+):
+    root = _hash(b"root", group_id=1)
+    left = _hash(b"same-child", group_id=1)
+    right = _hash(b"same-child", group_id=2)
+    standalone = _hash(b"standalone", group_id=0)
+    tracker = _tracker(policy, budget=budget)
+    assert tracker.register_chain([root, left])
+    assert tracker.register_chain([root, right])
+    assert tracker.register_chain([standalone])
+
+    for chain in (
+        [root, left],
+        [root, right],
+        [standalone],
+        [root, left],
+        [root, right],
+        [standalone],
+        [root, left],
+        [root, right],
+        [standalone],
+        [root, left],
+    ):
+        assert tracker.record_completed_access(chain)
+
+    snapshot = tracker.snapshot([left, standalone, right, root, left])
+    assert tracker.protected_hashes(snapshot) == _legacy_protected_hashes(
+        tracker, snapshot
+    )
+
+
+@pytest.mark.parametrize(
+    "policy",
+    (
+        PrefixRetentionPolicy.PREFIX_RECENCY,
+        PrefixRetentionPolicy.LFU,
+        PrefixRetentionPolicy.ARC,
+        PrefixRetentionPolicy.RECURPLAN,
+    ),
+)
+def test_shared_selector_matches_legacy_oracle_for_invalid_closures(
+    policy: PrefixRetentionPolicy,
+):
+    root, leaf = _hash(b"root"), _hash(b"leaf")
+    tracker = _tracker(policy, budget=2)
+    assert tracker.register_chain([root, leaf])
+    assert tracker.record_completed_access([root, leaf])
+
+    non_resident_ancestor = tracker.snapshot([leaf])
+    assert tracker.protected_hashes(
+        non_resident_ancestor
+    ) == _legacy_protected_hashes(tracker, non_resident_ancestor)
+    missing_metadata = replace(
+        tracker.snapshot([root, leaf]),
+        metadata=tuple(
+            item
+            for item in tracker.snapshot([root, leaf]).metadata
+            if item.block_hash != root
+        ),
+    )
+    assert tracker.protected_hashes(
+        missing_metadata
+    ) == _legacy_protected_hashes(tracker, missing_metadata)
+
+
+@pytest.mark.parametrize(
+    "policy",
+    (
+        PrefixRetentionPolicy.PREFIX_RECENCY,
+        PrefixRetentionPolicy.LFU,
+    ),
+)
+def test_shared_selector_uses_canonical_ties_for_equally_ranked_terminals(
+    policy: PrefixRetentionPolicy,
+):
+    earlier = _hash(b"a")
+    later = _hash(b"b")
+    tracker = _tracker(policy, budget=1)
+    assert tracker.register_chain([later])
+    assert tracker.register_chain([earlier])
+
+    snapshot = tracker.snapshot([later, earlier])
+    assert tracker.protected_hashes(snapshot) == {earlier}
+    assert tracker.protected_hashes(snapshot) == _legacy_protected_hashes(
+        tracker, snapshot
+    )
+
+
+def test_shared_selector_operation_stats_pin_mask_work():
+    root, leaf = _hash(b"root"), _hash(b"leaf")
+    tracker = _tracker(PrefixRetentionPolicy.PREFIX_RECENCY, budget=1)
+    assert tracker.register_chain([root, leaf])
+
+    protected, stats = tracker._protected_hashes_with_stats(
+        tracker.snapshot([root, leaf])
+    )
+
+    assert protected == {root}
+    assert stats.closure_constructions == 2
+    assert stats.candidate_evaluations == 3
+    assert stats.mask_operations == 6
+
+
+def test_shared_selector_only_reranks_candidates_with_equal_fixed_priority():
+    root, older, newer = _hash(b"root"), _hash(b"older"), _hash(b"newer")
+    tracker = _tracker(PrefixRetentionPolicy.PREFIX_RECENCY, budget=2)
+    assert tracker.register_chain([root, older])
+    assert tracker.register_chain([root, newer])
+    assert tracker.record_completed_access([root, older])
+    assert tracker.record_completed_access([root, newer])
+
+    protected, stats = tracker._protected_hashes_with_stats(
+        tracker.snapshot([root, older, newer])
+    )
+
+    assert protected == {root, newer}
+    assert stats.candidate_evaluations == 4
+
+
+def test_shared_selector_batches_each_selected_marginal_before_reranking():
+    root, shared = _hash(b"root"), _hash(b"shared")
+    earlier, later = _hash(b"earlier"), _hash(b"later")
+    tracker = _tracker(PrefixRetentionPolicy.RECURPLAN, budget=3)
+    assert tracker.register_chain([root, shared, earlier])
+    assert tracker.register_chain([root, shared, later])
+
+    # Only the leaves receive valid RecurPlan scores. Selecting `earlier`
+    # protects two shared ancestors at once, so `later` must be reranked once
+    # after the whole marginal update—not once for every changed bit.
+    snapshot = tracker.snapshot([root, shared, earlier, later])
+    snapshot = replace(
+        snapshot,
+        completed_ordinal=4,
+        metadata=tuple(
+            replace(
+                item,
+                completed_count=4,
+                last_access_ordinal=3,
+                gaps=(1, 1, 1),
+            )
+            if item.block_hash in {earlier, later}
+            else item
+            for item in snapshot.metadata
+        ),
+    )
+
+    protected, stats = tracker._protected_hashes_with_stats(snapshot)
+
+    assert protected == {root, shared, earlier}
+    assert stats.candidate_evaluations == 5
+    assert stats.mask_operations == 12
+
+
+def test_selector_benchmark_fixture_preserves_the_required_scale():
+    from benchmarks.benchmark_prefix_retention import (
+        build_prefix_retention_fixture,
+    )
+
+    fixture = build_prefix_retention_fixture()
+
+    assert len(fixture.snapshot.resident_hashes) == 4696
+    assert fixture.valid_terminal_count == 4665
+    assert fixture.tracker.budget_blocks == 1174
 
 
 def test_candidate_snapshots_are_identical_for_every_policy():
