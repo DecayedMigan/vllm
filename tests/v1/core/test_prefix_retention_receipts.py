@@ -31,6 +31,7 @@ from vllm.v1.core.prefix_retention_observer import (
     PrefixRetentionLocalState,
     PrefixRetentionReceipt,
     PrefixRetentionReceiptBatch,
+    PrefixRetentionRegisteredChainReceipt,
     PrefixRetentionResetReceipt,
     PrefixRetentionRuntimeConfigReceipt,
 )
@@ -155,7 +156,7 @@ def test_non_inproc_reset_receipt_helper_is_rejected_before_transport(client_typ
 
 def test_runtime_config_receipt_is_immutable():
     runtime = PrefixRetentionRuntimeConfigReceipt(
-        schema_version="amd-kv-retention-observer-v2",
+        schema_version="amd-kv-retention-observer-v3",
         policy="recurplan",
         budget_blocks=31,
         prefix_caching_enabled=True,
@@ -169,7 +170,7 @@ def test_runtime_config_receipt_is_immutable():
         observer_capacity=256,
     )
 
-    assert PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION == ("amd-kv-retention-observer-v2")
+    assert PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION == ("amd-kv-retention-observer-v3")
     assert runtime.policy == "recurplan"
     with pytest.raises(FrozenInstanceError):
         runtime.policy = "lru"  # type: ignore[misc]
@@ -226,6 +227,7 @@ def test_expanded_reset_receipt_is_immutable_and_union_is_closed():
             PrefixRetentionRuntimeConfigReceipt,
             PrefixRetentionDecisionReceipt,
             PrefixRetentionCompletedAccessReceipt,
+            PrefixRetentionRegisteredChainReceipt,
             PrefixRetentionResetReceipt,
         }
     )
@@ -684,6 +686,50 @@ def test_decision_receipt_freezes_recomputable_tracker_metadata():
     assert metadata[bytes(child).hex()].parent_group_id == 11
     assert metadata[bytes(child).hex()].completed_count == 2
     assert metadata[bytes(child).hex()].last_four_gaps == (2,)
+
+
+def test_successful_chain_registration_emits_a_v3_observer_receipt():
+    tracker = PrefixRetentionTracker(
+        policy=PrefixRetentionPolicy.ARC,
+        budget_blocks=2,
+        hash_block_size=4,
+    )
+    pool = BlockPool(
+        num_gpu_blocks=4,
+        enable_caching=True,
+        hash_block_size=4,
+        prefix_retention_tracker=tracker,
+        enable_prefix_retention_observer=True,
+    )
+    request = Mock()
+    request.request_id = "registered-request"
+    request.block_hashes = [
+        BlockHash(b"registered-root"),
+        BlockHash(b"registered-leaf"),
+    ]
+
+    pool.cache_full_blocks(
+        request=request,
+        blocks=pool.blocks[1:3],
+        num_cached_blocks=0,
+        num_full_blocks=2,
+        block_size=4,
+        kv_cache_group_id=3,
+    )
+
+    (receipt,) = _receipts(pool)
+    assert type(receipt).__name__ == "PrefixRetentionRegisteredChainReceipt"
+    assert receipt.schema_version == "amd-kv-retention-observer-v3"
+    assert receipt.request_id == "registered-request"
+    assert receipt.registration_ordinal == 1
+    assert receipt.policy == "arc"
+    assert receipt.budget_blocks == 2
+    assert receipt.tracker_generation == 0
+    assert receipt.completed_ordinal == 0
+    assert receipt.ordered_hash_chain == (
+        PrefixRetentionHashPreimage(bytes(_key(b"registered-root", 3)).hex(), 3),
+        PrefixRetentionHashPreimage(bytes(_key(b"registered-leaf", 3)).hex(), 3),
+    )
 
 
 def test_successful_completed_access_records_ordered_chain_after_tracker_update():

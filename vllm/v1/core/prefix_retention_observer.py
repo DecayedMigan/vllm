@@ -7,7 +7,7 @@ import json
 from dataclasses import asdict, dataclass
 from enum import Enum
 
-PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION = "amd-kv-retention-observer-v2"
+PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION = "amd-kv-retention-observer-v3"
 
 
 class PrefixRetentionBlockCategory(str, Enum):
@@ -126,6 +126,20 @@ class PrefixRetentionCompletedAccessReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class PrefixRetentionRegisteredChainReceipt:
+    """One successful tracker chain registration after cache publication."""
+
+    schema_version: str
+    request_id: str
+    registration_ordinal: int
+    policy: str
+    budget_blocks: int
+    tracker_generation: int
+    completed_ordinal: int
+    ordered_hash_chain: tuple[PrefixRetentionHashPreimage, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class PrefixRetentionRuntimeConfigReceipt:
     schema_version: str
     policy: str
@@ -178,6 +192,7 @@ PrefixRetentionReceipt = (
     PrefixRetentionRuntimeConfigReceipt
     | PrefixRetentionDecisionReceipt
     | PrefixRetentionCompletedAccessReceipt
+    | PrefixRetentionRegisteredChainReceipt
     | PrefixRetentionResetReceipt
 )
 

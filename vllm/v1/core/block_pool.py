@@ -38,6 +38,7 @@ from vllm.v1.core.prefix_retention_observer import (
     PrefixRetentionHashPreimage,
     PrefixRetentionReceiptBatch,
     PrefixRetentionReceiptBuffer,
+    PrefixRetentionRegisteredChainReceipt,
     PrefixRetentionResetReceipt,
     PrefixRetentionRuntimeConfigReceipt,
     PrefixRetentionTrackerMetadataPreimage,
@@ -214,6 +215,7 @@ class BlockPool:
             else None
         )
         self._prefix_retention_allocation_ordinal = 0
+        self._prefix_retention_registration_ordinal = 0
 
     @property
     def prefix_retention_observer_enabled(self) -> bool:
@@ -517,7 +519,40 @@ class BlockPool:
                 block.block_hash == block_hash
                 for block, block_hash in zip(blocks[:num_full_blocks], chain)
             ):
-                self.prefix_retention_tracker.register_chain(chain)
+                registered = self.prefix_retention_tracker.register_chain(chain)
+                buffer = self._prefix_retention_receipt_buffer
+                if buffer is not None:
+                    if not registered:
+                        buffer.mark_failed()
+                    else:
+                        try:
+                            state = self.prefix_retention_tracker.observation_state()
+                            self._prefix_retention_registration_ordinal += 1
+                            receipt = PrefixRetentionRegisteredChainReceipt(
+                                schema_version=(
+                                    PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION
+                                ),
+                                request_id=request.request_id,
+                                registration_ordinal=(
+                                    self._prefix_retention_registration_ordinal
+                                ),
+                                policy=self.prefix_retention_tracker.policy.value,
+                                budget_blocks=(
+                                    self.prefix_retention_tracker.budget_blocks
+                                ),
+                                tracker_generation=state.generation,
+                                completed_ordinal=state.completed_ordinal,
+                                ordered_hash_chain=tuple(
+                                    PrefixRetentionHashPreimage(
+                                        block_hash_hex=bytes(block_hash).hex(),
+                                        group_id=get_group_id(block_hash),
+                                    )
+                                    for block_hash in chain
+                                ),
+                            )
+                            buffer.append(receipt)
+                        except Exception:
+                            buffer.mark_failed()
 
         if self.enable_kv_cache_events:
             if num_cached_blocks == 0:
