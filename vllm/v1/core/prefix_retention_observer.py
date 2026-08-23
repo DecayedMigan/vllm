@@ -7,7 +7,7 @@ import json
 from dataclasses import asdict, dataclass
 from enum import Enum
 
-PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION = "amd-kv-retention-observer-v3"
+PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION = "gladius-kv-retention-observer-v4"
 
 
 class PrefixRetentionBlockCategory(str, Enum):

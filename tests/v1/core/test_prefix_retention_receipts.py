@@ -156,7 +156,7 @@ def test_non_inproc_reset_receipt_helper_is_rejected_before_transport(client_typ
 
 def test_runtime_config_receipt_is_immutable():
     runtime = PrefixRetentionRuntimeConfigReceipt(
-        schema_version="amd-kv-retention-observer-v3",
+        schema_version="gladius-kv-retention-observer-v4",
         policy="recurplan",
         budget_blocks=31,
         prefix_caching_enabled=True,
@@ -170,7 +170,9 @@ def test_runtime_config_receipt_is_immutable():
         observer_capacity=256,
     )
 
-    assert PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION == ("amd-kv-retention-observer-v3")
+    assert PREFIX_RETENTION_OBSERVER_SCHEMA_VERSION == (
+        "gladius-kv-retention-observer-v4"
+    )
     assert runtime.policy == "recurplan"
     with pytest.raises(FrozenInstanceError):
         runtime.policy = "lru"  # type: ignore[misc]
@@ -688,7 +690,7 @@ def test_decision_receipt_freezes_recomputable_tracker_metadata():
     assert metadata[bytes(child).hex()].last_four_gaps == (2,)
 
 
-def test_successful_chain_registration_emits_a_v3_observer_receipt():
+def test_successful_chain_registration_emits_a_neutral_v4_observer_receipt():
     tracker = PrefixRetentionTracker(
         policy=PrefixRetentionPolicy.ARC,
         budget_blocks=2,
@@ -719,7 +721,7 @@ def test_successful_chain_registration_emits_a_v3_observer_receipt():
 
     (receipt,) = _receipts(pool)
     assert type(receipt).__name__ == "PrefixRetentionRegisteredChainReceipt"
-    assert receipt.schema_version == "amd-kv-retention-observer-v3"
+    assert receipt.schema_version == "gladius-kv-retention-observer-v4"
     assert receipt.request_id == "registered-request"
     assert receipt.registration_ordinal == 1
     assert receipt.policy == "arc"
